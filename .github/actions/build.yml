@@ -1,4 +1,4 @@
-name: Build and Publish Zed Artifact for Windows
+name: Build and Publish Zed Artifact for Windows rt
 
 on:
   push:
