@@ -1,0 +1,63 @@
+name: Build and Publish Zed Artifact for Windows rt
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        run: rustup update
+
+      - name: Install Rust wasm toolchain
+        run: rustup target add wasm32-wasip1
+
+      - name: Install Visual Studio with MSVC build tools
+        run: choco install visualstudio2022buildtools --package-parameters "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+
+      - name: Install Windows SDK
+        run: choco install windows-sdk-10.1
+
+      - name: Verify Rust installation
+        run: rustc --version
+
+      - name: Build Zed (Release)
+        run: cargo build --release
+
+      - name: Upload Zed binary as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: zed-binary
+          path: target/release/zed.exe  # Update this path if the binary has a different name
+
+  msys2:
+    runs-on: windows-latest
+
+    steps:
+      - name: Install MSYS2
+        run: choco install msys2
+
+      - name: Update MSYS2
+        run: |
+          C:\msys64\usr\bin\bash -lc "pacman -Syu --noconfirm"
+
+      - name: Install Zed via MSYS2
+        run: |
+          C:\msys64\usr\bin\bash -lc "pacman -S mingw-w64-ucrt-x86_64-zed --noconfirm"
+
+      - name: Upload MSYS2 Zed binary as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: msys2-zed-binary
+          path: /mingw64/bin/zed  # Adjust path if necessary
+
