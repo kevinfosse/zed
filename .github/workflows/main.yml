@@ -22,7 +22,9 @@ jobs:
       - name: Install Rust wasm toolchain
         run: rustup target add wasm32-wasip1
       - name: Install Visual Studio with MSVC build tools
-        run: choco install visualstudio2022buildtools --package-parameters "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+        run: |
+          choco install visualstudio2022buildtools --package-parameters "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.VC.ASAN --add Microsoft.VisualStudio.Component.VC.Redist.MSM --add Microsoft.VisualStudio.Component.VC.ATL --add Microsoft.VisualStudio.Component.VC.ATLMFC --add Microsoft.VisualStudio.Component.VC.v141.x86.x64 --add Microsoft.VisualStudio.Component.Windows10SDK"
+          
       - name: Install Windows SDK
         run: choco install windows-sdk-10.1
       - name: Verify Rust installation
@@ -34,6 +36,13 @@ jobs:
         run: |
           $env:CARGO_HOME = "C:\cargo"
           [System.Environment]::SetEnvironmentVariable('CARGO_HOME', 'C:\cargo', [System.EnvironmentVariableTarget]::Machine)
+        shell: powershell
+        
+      - name: Configure environment for Spectre Mitigation
+        run: |
+          # Set environment variable to skip Spectre mitigation libraries requirement
+          echo "CARGO_FEATURE_NO_SPECTRE_MITIGATION=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "RUSTFLAGS=-C target-feature=-spectre-v2" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
         shell: powershell
         
       - name: Build Zed (Release)
