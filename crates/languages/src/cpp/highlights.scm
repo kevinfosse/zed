@@ -1,9 +1,36 @@
 (identifier) @variable
 (field_identifier) @property
+(namespace_identifier) @namespace
+
+(concept_definition
+    (identifier) @concept)
+
 
 (call_expression
   function: (qualified_identifier
     name: (identifier) @function))
+
+(call_expression
+  (qualified_identifier
+    (identifier) @function.call))
+
+(call_expression
+  (qualified_identifier
+    (qualified_identifier
+      (identifier) @function.call)))
+
+(call_expression
+  (qualified_identifier
+    (qualified_identifier
+      (qualified_identifier
+        (identifier) @function.call))))
+
+((qualified_identifier
+  (qualified_identifier
+    (qualified_identifier
+      (qualified_identifier
+        (identifier) @function.call)))) @_parent
+  (#has-ancestor? @_parent call_expression))
 
 (call_expression
   function: (identifier) @function)
@@ -41,6 +68,15 @@
 
 (auto) @type
 (type_identifier) @type
+type :(primitive_type) @type.primitive
+(sized_type_specifier) @type.primitive
+
+(requires_clause
+    constraint: (template_type
+        name: (type_identifier) @concept))
+
+(attribute
+    name: (identifier) @keyword)
 
 ((identifier) @constant
  (#match? @constant "^_*[A-Z][A-Z\\d_]*$"))
@@ -94,12 +130,10 @@
   "typename"
   "union"
   "using"
+  "virtual"
   "while"
-  (primitive_type)
-  (sized_type_specifier)
   (storage_class_specifier)
   (type_qualifier)
-  (virtual)
 ] @keyword
 
 [
@@ -119,9 +153,12 @@
 [
   (true)
   (false)
+] @boolean
+
+[
   (null)
   ("nullptr")
-] @constant
+] @constant.builtin
 
 (number_literal) @number
 

@@ -1,105 +1,142 @@
-// Allow binary to be called Zed for a nice application menu when running executable directly
-#![allow(non_snake_case)]
 // Disable command line from opening on release mode
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod reliability;
 mod zed;
 
-use anyhow::{anyhow, Context as _, Result};
-use assistant::PromptBuilder;
-use chrono::Offset;
-use clap::{command, Parser};
+use anyhow::{Context as _, Result, anyhow};
+use clap::{Parser, command};
 use cli::FORCE_CLI_MODE_ENV_VAR_NAME;
-use client::{parse_zed_link, Client, DevServerToken, UserStore};
+use client::{Client, ProxySettings, UserStore, parse_zed_link};
 use collab_ui::channel_view::ChannelView;
-use db::kvp::KEY_VALUE_STORE;
+use collections::HashMap;
+use db::kvp::{GLOBAL_KEY_VALUE_STORE, KEY_VALUE_STORE};
 use editor::Editor;
-use env_logger::Builder;
+use extension::ExtensionHostProxy;
+use extension_host::ExtensionStore;
 use fs::{Fs, RealFs};
-use futures::{future, StreamExt};
+use futures::{StreamExt, future};
 use git::GitHostingProviderRegistry;
-use gpui::{
-    Action, App, AppContext, AsyncAppContext, Context, DismissEvent, Global, Task,
-    UpdateGlobal as _, VisualContext,
-};
+use gpui::{App, AppContext as _, Application, AsyncApp, UpdateGlobal as _};
+
+use gpui_tokio::Tokio;
+use http_client::{Uri, read_proxy_from_env};
 use language::LanguageRegistry;
-use log::LevelFilter;
+use prompt_store::PromptBuilder;
+use reqwest_client::ReqwestClient;
 
 use assets::Assets;
-use node_runtime::RealNodeRuntime;
+use node_runtime::{NodeBinaryOptions, NodeRuntime};
 use parking_lot::Mutex;
-use recent_projects::open_ssh_project;
-use release_channel::{AppCommitSha, AppVersion};
+use project::project_settings::ProjectSettings;
+use recent_projects::{SshSettings, open_ssh_project};
+use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use session::{AppSession, Session};
-use settings::{handle_settings_file_changes, watch_config_file, Settings, SettingsStore};
-use simplelog::ConfigBuilder;
-use smol::process::Command;
+use settings::{Settings, SettingsStore, watch_config_file};
 use std::{
     env,
-    fs::OpenOptions,
-    io::{IsTerminal, Write},
-    path::Path,
+    io::{self, IsTerminal},
+    path::{Path, PathBuf},
     process,
     sync::Arc,
 };
-use theme::{ActiveTheme, SystemAppearance, ThemeRegistry, ThemeSettings};
-use time::UtcOffset;
-use util::{maybe, parse_env_output, ResultExt, TryFutureExt};
-use uuid::Uuid;
-use welcome::{show_welcome_view, BaseKeymap, FIRST_OPEN};
-use workspace::{
-    notifications::{simple_message_notification::MessageNotification, NotificationId},
-    AppState, WorkspaceSettings, WorkspaceStore,
+use theme::{
+    ActiveTheme, IconThemeNotFoundError, SystemAppearance, ThemeNotFoundError, ThemeRegistry,
+    ThemeSettings,
 };
+use util::{ResultExt, TryFutureExt, maybe};
+use uuid::Uuid;
+use welcome::{BaseKeymap, FIRST_OPEN, show_welcome_view};
+use workspace::{AppState, SerializedWorkspaceLocation, WorkspaceSettings, WorkspaceStore};
 use zed::{
-    app_menus, build_window_options, handle_cli_connection, handle_keymap_file_changes,
-    initialize_workspace, open_paths_with_positions, OpenListener, OpenRequest,
+    OpenListener, OpenRequest, app_menus, build_window_options, derive_paths_with_position,
+    handle_cli_connection, handle_keymap_file_changes, handle_settings_changed,
+    handle_settings_file_changes, initialize_workspace, inline_completion_registry,
+    open_paths_with_positions,
 };
 
-use crate::zed::inline_completion_registry;
+#[cfg(unix)]
+use util::{load_login_shell_environment, load_shell_from_passwd};
 
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn fail_to_launch(e: anyhow::Error) {
-    eprintln!("Zed failed to launch: {e:?}");
-    App::new().run(move |cx| {
-        if let Ok(window) = cx.open_window(gpui::WindowOptions::default(), |cx| cx.new_view(|_| gpui::Empty)) {
-            window.update(cx, |_, cx| {
-                let response = cx.prompt(gpui::PromptLevel::Critical, "Zed failed to launch", Some(&format!("{e}\n\nFor help resolving this, please open an issue on https://github.com/zed-industries/zed")), &["Exit"]);
+fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
+    let message = "Zed failed to launch";
+    let error_details = errors
+        .into_iter()
+        .flat_map(|(kind, paths)| {
+            #[allow(unused_mut)] // for non-unix platforms
+            let mut error_kind_details = match paths.len() {
+                0 => return None,
+                1 => format!(
+                    "{kind} when creating directory {:?}",
+                    paths.first().expect("match arm checks for a single entry")
+                ),
+                _many => format!("{kind} when creating directories {paths:?}"),
+            };
 
-                cx.spawn(|_, mut cx| async move {
-                    response.await?;
-                    cx.update(|cx| {
-                        cx.quit()
+            #[cfg(unix)]
+            {
+                match kind {
+                    io::ErrorKind::PermissionDenied => {
+                        error_kind_details.push_str("\n\nConsider using chown and chmod tools for altering the directories permissions if your user has corresponding rights.\
+                            \nFor example, `sudo chown $(whoami):staff ~/.config` and `chmod +uwrx ~/.config`");
+                    }
+                    _ => {}
+                }
+            }
+
+            Some(error_kind_details)
+        })
+        .collect::<Vec<_>>().join("\n\n");
+
+    eprintln!("{message}: {error_details}");
+    Application::new().run(move |cx| {
+        if let Ok(window) = cx.open_window(gpui::WindowOptions::default(), |_, cx| {
+            cx.new(|_| gpui::Empty)
+        }) {
+            window
+                .update(cx, |_, window, cx| {
+                    let response = window.prompt(
+                        gpui::PromptLevel::Critical,
+                        message,
+                        Some(&error_details),
+                        &["Exit"],
+                        cx,
+                    );
+
+                    cx.spawn_in(window, async move |_, cx| {
+                        response.await?;
+                        cx.update(|_, cx| cx.quit())
                     })
-                }).detach_and_log_err(cx);
-            }).log_err();
+                    .detach_and_log_err(cx);
+                })
+                .log_err();
         } else {
-            fail_to_open_window(e, cx)
+            fail_to_open_window(anyhow::anyhow!("{message}: {error_details}"), cx)
         }
     })
 }
 
-fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncAppContext) {
+fn fail_to_open_window_async(e: anyhow::Error, cx: &mut AsyncApp) {
     cx.update(|cx| fail_to_open_window(e, cx)).log_err();
 }
 
-fn fail_to_open_window(e: anyhow::Error, _cx: &mut AppContext) {
+fn fail_to_open_window(e: anyhow::Error, _cx: &mut App) {
     eprintln!(
         "Zed failed to open a window: {e:?}. See https://zed.dev/docs/linux for troubleshooting steps."
     );
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     {
         process::exit(1);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     {
         use ashpd::desktop::notification::{Notification, NotificationProxy, Priority};
-        _cx.spawn(|_cx| async move {
+        _cx.spawn(async move |_cx| {
             let Ok(proxy) = NotificationProxy::new().await else {
                 process::exit(1);
             };
@@ -129,249 +166,118 @@ fn fail_to_open_window(e: anyhow::Error, _cx: &mut AppContext) {
     }
 }
 
-enum AppMode {
-    Headless(DevServerToken),
-    Ui,
-}
-impl Global for AppMode {}
-
-fn init_headless(
-    dev_server_token: DevServerToken,
-    app_state: Arc<AppState>,
-    cx: &mut AppContext,
-) -> Task<Result<()>> {
-    match cx.try_global::<AppMode>() {
-        Some(AppMode::Headless(token)) if token == &dev_server_token => return Task::ready(Ok(())),
-        Some(_) => {
-            return Task::ready(Err(anyhow!(
-                "zed is already running. Use `kill {}` to stop it",
-                process::id()
-            )))
-        }
-        None => {
-            cx.set_global(AppMode::Headless(dev_server_token.clone()));
-        }
-    };
-    let client = app_state.client.clone();
-    client.set_dev_server_token(dev_server_token);
-    headless::init(
-        client.clone(),
-        headless::AppState {
-            languages: app_state.languages.clone(),
-            user_store: app_state.user_store.clone(),
-            fs: app_state.fs.clone(),
-            node_runtime: app_state.node_runtime.clone(),
-        },
-        cx,
-    )
-}
-
-// init_common is called for both headless and normal mode.
-fn init_common(app_state: Arc<AppState>, cx: &mut AppContext) -> Arc<PromptBuilder> {
-    SystemAppearance::init(cx);
-    theme::init(theme::LoadThemes::All(Box::new(Assets)), cx);
-    command_palette::init(cx);
-    let copilot_language_server_id = app_state.languages.next_language_server_id();
-    copilot::init(
-        copilot_language_server_id,
-        app_state.fs.clone(),
-        app_state.client.http_client(),
-        app_state.node_runtime.clone(),
-        cx,
-    );
-    supermaven::init(app_state.client.clone(), cx);
-    language_model::init(
-        app_state.user_store.clone(),
-        app_state.client.clone(),
-        app_state.fs.clone(),
-        cx,
-    );
-    snippet_provider::init(cx);
-    inline_completion_registry::init(app_state.client.telemetry().clone(), cx);
-    let prompt_builder = assistant::init(
-        app_state.fs.clone(),
-        app_state.client.clone(),
-        stdout_is_a_pty(),
-        cx,
-    );
-    repl::init(
-        app_state.fs.clone(),
-        app_state.client.telemetry().clone(),
-        cx,
-    );
-    extension::init(
-        app_state.fs.clone(),
-        app_state.client.clone(),
-        app_state.node_runtime.clone(),
-        app_state.languages.clone(),
-        ThemeRegistry::global(cx),
-        cx,
-    );
-    prompt_builder
-}
-
-fn init_ui(
-    app_state: Arc<AppState>,
-    prompt_builder: Arc<PromptBuilder>,
-    cx: &mut AppContext,
-) -> Result<()> {
-    match cx.try_global::<AppMode>() {
-        Some(AppMode::Headless(_)) => {
-            return Err(anyhow!(
-                "zed is already running in headless mode. Use `kill {}` to stop it",
-                process::id()
-            ))
-        }
-        Some(AppMode::Ui) => return Ok(()),
-        None => {
-            cx.set_global(AppMode::Ui);
-        }
-    };
-
-    load_embedded_fonts(cx);
-
-    #[cfg(target_os = "linux")]
-    crate::zed::linux_prompts::init(cx);
-
-    app_state.languages.set_theme(cx.theme().clone());
-    editor::init(cx);
-    image_viewer::init(cx);
-    diagnostics::init(cx);
-
-    audio::init(Assets, cx);
-    workspace::init(app_state.clone(), cx);
-
-    recent_projects::init(cx);
-    go_to_line::init(cx);
-    file_finder::init(cx);
-    tab_switcher::init(cx);
-    dev_server_projects::init(app_state.client.clone(), cx);
-    outline::init(cx);
-    project_symbols::init(cx);
-    project_panel::init(Assets, cx);
-    outline_panel::init(Assets, cx);
-    tasks_ui::init(cx);
-    channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
-    search::init(cx);
-    vim::init(cx);
-    terminal_view::init(cx);
-    journal::init(app_state.clone(), cx);
-    language_selector::init(cx);
-    theme_selector::init(cx);
-    language_tools::init(cx);
-    call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-    notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
-    collab_ui::init(&app_state, cx);
-    feedback::init(cx);
-    markdown_preview::init(cx);
-    welcome::init(cx);
-    settings_ui::init(cx);
-    extensions_ui::init(cx);
-
-    cx.observe_global::<SettingsStore>({
-        let languages = app_state.languages.clone();
-        let http = app_state.client.http_client();
-        let client = app_state.client.clone();
-
-        move |cx| {
-            for &mut window in cx.windows().iter_mut() {
-                let background_appearance = cx.theme().window_background_appearance();
-                window
-                    .update(cx, |_, cx| {
-                        cx.set_background_appearance(background_appearance)
-                    })
-                    .ok();
-            }
-            languages.set_theme(cx.theme().clone());
-            let new_host = &client::ClientSettings::get_global(cx).server_url;
-            if &http.base_url() != new_host {
-                http.set_base_url(new_host);
-                if client.status().borrow().is_connected() {
-                    client.reconnect(&cx.to_async());
-                }
-            }
-        }
-    })
-    .detach();
-    let telemetry = app_state.client.telemetry();
-    telemetry.report_setting_event("theme", cx.theme().name.to_string());
-    telemetry.report_setting_event("keymap", BaseKeymap::get_global(cx).to_string());
-    telemetry.flush_events();
-
-    let fs = app_state.fs.clone();
-    load_user_themes_in_background(fs.clone(), cx);
-    watch_themes(fs.clone(), cx);
-    watch_languages(fs.clone(), app_state.languages.clone(), cx);
-    watch_file_types(fs.clone(), cx);
-
-    cx.set_menus(app_menus());
-    initialize_workspace(app_state.clone(), prompt_builder, cx);
-
-    cx.activate(true);
-
-    cx.spawn(|cx| async move { authenticate(app_state.client.clone(), &cx).await })
-        .detach_and_log_err(cx);
-
-    Ok(())
-}
-
 fn main() {
-    menu::init();
-    zed_actions::init();
-
-    if let Err(e) = init_paths() {
-        fail_to_launch(e);
+    // Check if there is a pending installer
+    // If there is, run the installer and exit
+    // And we don't want to run the installer if we are not the first instance
+    #[cfg(target_os = "windows")]
+    let is_first_instance = crate::zed::windows_only_instance::is_first_instance();
+    #[cfg(target_os = "windows")]
+    if is_first_instance && auto_update::check_pending_installation() {
         return;
     }
 
-    init_logger();
+    let args = Args::parse();
+
+    if let Some(socket) = &args.askpass {
+        askpass::main(socket);
+        return;
+    }
+
+    // Set custom data directory.
+    if let Some(dir) = &args.user_data_dir {
+        paths::set_custom_data_dir(dir);
+    }
+
+    #[cfg(all(not(debug_assertions), target_os = "windows"))]
+    unsafe {
+        use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+
+        if args.foreground {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+
+    menu::init();
+    zed_actions::init();
+
+    let file_errors = init_paths();
+    if !file_errors.is_empty() {
+        files_not_created_on_launch(file_errors);
+        return;
+    }
+
+    zlog::init();
+    if stdout_is_a_pty() {
+        zlog::init_output_stdout();
+    } else {
+        let result = zlog::init_output_file(paths::log_file(), Some(paths::old_log_file()));
+        if let Err(err) = result {
+            eprintln!("Could not open log file: {}... Defaulting to stdout", err);
+            zlog::init_output_stdout();
+        };
+    }
+
+    let app_version = AppVersion::load(env!("CARGO_PKG_VERSION"));
+    let app_commit_sha =
+        option_env!("ZED_COMMIT_SHA").map(|commit_sha| AppCommitSha(commit_sha.to_string()));
+
+    if args.system_specs {
+        let system_specs = feedback::system_specs::SystemSpecs::new_stateless(
+            app_version,
+            app_commit_sha.clone(),
+            *release_channel::RELEASE_CHANNEL,
+        );
+        println!("Zed System Specs (from CLI):\n{}", system_specs);
+        return;
+    }
 
     log::info!("========== starting zed ==========");
-    let app = App::new().with_assets(Assets);
 
-    let (installation_id, existing_installation_id_found) = app
-        .background_executor()
-        .block(installation_id())
-        .ok()
-        .unzip();
+    let app = Application::new().with_assets(Assets);
 
+    let system_id = app.background_executor().block(system_id()).ok();
+    let installation_id = app.background_executor().block(installation_id()).ok();
+    let session_id = Uuid::new_v4().to_string();
     let session = app.background_executor().block(Session::new());
 
-    let app_version = AppVersion::init(env!("CARGO_PKG_VERSION"));
     reliability::init_panic_hook(
-        installation_id.clone(),
         app_version,
-        session.id().to_owned(),
+        app_commit_sha.clone(),
+        system_id.as_ref().map(|id| id.to_string()),
+        installation_id.as_ref().map(|id| id.to_string()),
+        session_id.clone(),
     );
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    #[cfg(target_os = "linux")]
-    {
-        if env::var("ZED_STATELESS").is_err() {
-            if crate::zed::listen_for_cli_connections(open_listener.clone()).is_err() {
-                println!("zed is already running");
-                return;
+    let failed_single_instance_check =
+        if *db::ZED_STATELESS || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev {
+            false
+        } else {
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            {
+                crate::zed::listen_for_cli_connections(open_listener.clone()).is_err()
             }
-        }
-    }
 
-    #[cfg(target_os = "windows")]
-    {
-        use zed::windows_only_instance::*;
-        if !check_single_instance() {
-            println!("zed is already running");
-            return;
-        }
-    }
+            #[cfg(target_os = "windows")]
+            {
+                !crate::zed::windows_only_instance::handle_single_instance(
+                    open_listener.clone(),
+                    &args,
+                    is_first_instance,
+                )
+            }
 
-    #[cfg(target_os = "macos")]
-    {
-        use zed::mac_only_instance::*;
-        if ensure_only_instance() != IsOnlyInstance::Yes {
-            println!("zed is already running");
-            return;
-        }
+            #[cfg(target_os = "macos")]
+            {
+                use zed::mac_only_instance::*;
+                ensure_only_instance() != IsOnlyInstance::Yes
+            }
+        };
+    if failed_single_instance_check {
+        println!("zed is already running");
+        return;
     }
 
     let git_hosting_provider_registry = Arc::new(GitHostingProviderRegistry::new());
@@ -385,10 +291,7 @@ fn main() {
         };
     log::info!("Using git binary path: {:?}", git_binary_path);
 
-    let fs = Arc::new(RealFs::new(
-        git_hosting_provider_registry.clone(),
-        git_binary_path,
-    ));
+    let fs = Arc::new(RealFs::new(git_binary_path, app.background_executor()));
     let user_settings_file_rx = watch_config_file(
         &app.background_executor(),
         fs.clone(),
@@ -400,16 +303,14 @@ fn main() {
         paths::keymap_file().clone(),
     );
 
-    let login_shell_env_loaded = if stdout_is_a_pty() {
-        Task::ready(())
-    } else {
-        app.background_executor().spawn(async {
-            #[cfg(unix)]
-            {
-                load_shell_from_passwd().await.log_err();
-            }
-            load_login_shell_environment().await.log_err();
-        })
+    #[cfg(unix)]
+    if !stdout_is_a_pty() {
+        app.background_executor()
+            .spawn(async {
+                load_shell_from_passwd().log_err();
+                load_login_shell_environment().log_err();
+            })
+            .detach()
     };
 
     app.on_open_urls({
@@ -421,7 +322,7 @@ fn main() {
         {
             cx.spawn({
                 let app_state = app_state.clone();
-                |mut cx| async move {
+                async move |mut cx| {
                     if let Err(e) = restore_or_create_workspace(app_state, &mut cx).await {
                         fail_to_open_window_async(e, &mut cx)
                     }
@@ -433,9 +334,38 @@ fn main() {
 
     app.run(move |cx| {
         release_channel::init(app_version, cx);
-        if let Some(build_sha) = option_env!("ZED_COMMIT_SHA") {
-            AppCommitSha::set_global(AppCommitSha(build_sha.into()), cx);
+        gpui_tokio::init(cx);
+        if let Some(app_commit_sha) = app_commit_sha {
+            AppCommitSha::set_global(app_commit_sha, cx);
         }
+        settings::init(cx);
+        zlog_settings::init(cx);
+        handle_settings_file_changes(user_settings_file_rx, cx, handle_settings_changed);
+        handle_keymap_file_changes(user_keymap_file_rx, cx);
+        client::init_settings(cx);
+        let user_agent = format!(
+            "Zed/{} ({}; {})",
+            AppVersion::global(cx),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        let proxy_str = ProxySettings::get_global(cx).proxy.to_owned();
+        let proxy_url = proxy_str
+            .as_ref()
+            .and_then(|input| {
+                input
+                    .parse::<Uri>()
+                    .inspect_err(|e| log::error!("Error parsing proxy settings: {}", e))
+                    .ok()
+            })
+            .or_else(read_proxy_from_env);
+        let http = {
+            let _guard = Tokio::handle(cx).enter();
+
+            ReqwestClient::proxy_and_user_agent(proxy_url, &user_agent)
+                .expect("could not start HTTP client")
+        };
+        cx.set_http_client(Arc::new(http));
 
         <dyn Fs>::set_global(fs.clone(), cx);
 
@@ -444,40 +374,78 @@ fn main() {
 
         OpenListener::set_global(cx, open_listener.clone());
 
-        settings::init(cx);
-        handle_settings_file_changes(user_settings_file_rx, cx, handle_settings_changed);
-        handle_keymap_file_changes(user_keymap_file_rx, cx, handle_keymap_changed);
+        extension::init(cx);
+        let extension_host_proxy = ExtensionHostProxy::global(cx);
 
-        client::init_settings(cx);
         let client = Client::production(cx);
         cx.set_http_client(client.http_client().clone());
-        let mut languages =
-            LanguageRegistry::new(login_shell_env_loaded, cx.background_executor().clone());
+        let mut languages = LanguageRegistry::new(cx.background_executor().clone());
         languages.set_language_server_download_dir(paths::languages_dir().clone());
         let languages = Arc::new(languages);
-        let node_runtime = RealNodeRuntime::new(client.http_client());
+        let (tx, rx) = async_watch::channel(None);
+        cx.observe_global::<SettingsStore>(move |cx| {
+            let settings = &ProjectSettings::get_global(cx).node;
+            let options = NodeBinaryOptions {
+                allow_path_lookup: !settings.ignore_system_version.unwrap_or_default(),
+                // TODO: Expose this setting
+                allow_binary_download: true,
+                use_paths: settings.path.as_ref().map(|node_path| {
+                    let node_path = PathBuf::from(shellexpand::tilde(node_path).as_ref());
+                    let npm_path = settings
+                        .npm_path
+                        .as_ref()
+                        .map(|path| PathBuf::from(shellexpand::tilde(&path).as_ref()));
+                    (
+                        node_path.clone(),
+                        npm_path.unwrap_or_else(|| {
+                            let base_path = PathBuf::new();
+                            node_path.parent().unwrap_or(&base_path).join("npm")
+                        }),
+                    )
+                }),
+            };
+            tx.send(Some(options)).log_err();
+        })
+        .detach();
+        let node_runtime = NodeRuntime::new(client.http_client(), rx);
 
         language::init(cx);
+        language_extension::init(extension_host_proxy.clone(), languages.clone());
         languages::init(languages.clone(), node_runtime.clone(), cx);
-        let user_store = cx.new_model(|cx| UserStore::new(client.clone(), cx));
-        let workspace_store = cx.new_model(|cx| WorkspaceStore::new(client.clone(), cx));
+        let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+        let workspace_store = cx.new(|cx| WorkspaceStore::new(client.clone(), cx));
 
         Client::set_global(client.clone(), cx);
 
         zed::init(cx);
         project::Project::init(&client, cx);
+        debugger_ui::init(cx);
+        debugger_tools::init(cx);
         client::init(&client, cx);
-        language::init(cx);
         let telemetry = client.telemetry();
-        telemetry.start(installation_id.clone(), session.id().to_owned(), cx);
-        telemetry.report_app_event(
-            match existing_installation_id_found {
-                Some(false) => "first open",
-                _ => "open",
-            }
-            .to_string(),
+        telemetry.start(
+            system_id.as_ref().map(|id| id.to_string()),
+            installation_id.as_ref().map(|id| id.to_string()),
+            session_id.clone(),
+            cx,
         );
-        let app_session = cx.new_model(|cx| AppSession::new(session, cx));
+
+        // We should rename these in the future to `first app open`, `first app open for release channel`, and `app open`
+        if let (Some(system_id), Some(installation_id)) = (&system_id, &installation_id) {
+            match (&system_id, &installation_id) {
+                (IdType::New(_), IdType::New(_)) => {
+                    telemetry::event!("App First Opened");
+                    telemetry::event!("App First Opened For Release Channel");
+                }
+                (IdType::Existing(_), IdType::New(_)) => {
+                    telemetry::event!("App First Opened For Release Channel");
+                }
+                (_, IdType::Existing(_)) => {
+                    telemetry::event!("App Opened");
+                }
+            }
+        }
+        let app_session = cx.new(|cx| AppSession::new(session, cx));
 
         let app_state = Arc::new(AppState {
             languages: languages.clone(),
@@ -492,10 +460,169 @@ fn main() {
         AppState::set_global(Arc::downgrade(&app_state), cx);
 
         auto_update::init(client.http_client(), cx);
-        reliability::init(client.http_client(), installation_id, cx);
-        let prompt_builder = init_common(app_state.clone(), cx);
+        dap_adapters::init(cx);
+        auto_update_ui::init(cx);
+        reliability::init(
+            client.http_client(),
+            system_id.as_ref().map(|id| id.to_string()),
+            installation_id.clone().map(|id| id.to_string()),
+            session_id.clone(),
+            cx,
+        );
 
-        let args = Args::parse();
+        SystemAppearance::init(cx);
+        theme::init(theme::LoadThemes::All(Box::new(Assets)), cx);
+        theme_extension::init(
+            extension_host_proxy.clone(),
+            ThemeRegistry::global(cx),
+            cx.background_executor().clone(),
+        );
+        command_palette::init(cx);
+        let copilot_language_server_id = app_state.languages.next_language_server_id();
+        copilot::init(
+            copilot_language_server_id,
+            app_state.fs.clone(),
+            app_state.client.http_client(),
+            app_state.node_runtime.clone(),
+            cx,
+        );
+        supermaven::init(app_state.client.clone(), cx);
+        language_model::init(app_state.client.clone(), cx);
+        language_models::init(
+            app_state.user_store.clone(),
+            app_state.client.clone(),
+            app_state.fs.clone(),
+            cx,
+        );
+        web_search::init(cx);
+        web_search_providers::init(app_state.client.clone(), cx);
+        snippet_provider::init(cx);
+        inline_completion_registry::init(
+            app_state.client.clone(),
+            app_state.user_store.clone(),
+            cx,
+        );
+        let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
+        assistant::init(
+            app_state.fs.clone(),
+            app_state.client.clone(),
+            prompt_builder.clone(),
+            cx,
+        );
+        agent::init(
+            app_state.fs.clone(),
+            app_state.client.clone(),
+            prompt_builder.clone(),
+            cx,
+        );
+        assistant_tools::init(app_state.client.http_client(), cx);
+        repl::init(app_state.fs.clone(), cx);
+        extension_host::init(
+            extension_host_proxy,
+            app_state.fs.clone(),
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            cx,
+        );
+        recent_projects::init(cx);
+
+        load_embedded_fonts(cx);
+
+        app_state.languages.set_theme(cx.theme().clone());
+        editor::init(cx);
+        image_viewer::init(cx);
+        repl::notebook::init(cx);
+        diagnostics::init(cx);
+
+        audio::init(Assets, cx);
+        workspace::init(app_state.clone(), cx);
+        ui_prompt::init(cx);
+
+        go_to_line::init(cx);
+        file_finder::init(cx);
+        tab_switcher::init(cx);
+        outline::init(cx);
+        project_symbols::init(cx);
+        project_panel::init(cx);
+        outline_panel::init(cx);
+        tasks_ui::init(cx);
+        snippets_ui::init(cx);
+        channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
+        search::init(cx);
+        vim::init(cx);
+        terminal_view::init(cx);
+        journal::init(app_state.clone(), cx);
+        language_selector::init(cx);
+        toolchain_selector::init(cx);
+        theme_selector::init(cx);
+        language_tools::init(cx);
+        call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+        notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+        collab_ui::init(&app_state, cx);
+        git_ui::init(cx);
+        feedback::init(cx);
+        markdown_preview::init(cx);
+        welcome::init(cx);
+        settings_ui::init(cx);
+        extensions_ui::init(cx);
+        zeta::init(cx);
+
+        cx.observe_global::<SettingsStore>({
+            let fs = fs.clone();
+            let languages = app_state.languages.clone();
+            let http = app_state.client.http_client();
+            let client = app_state.client.clone();
+            move |cx| {
+                for &mut window in cx.windows().iter_mut() {
+                    let background_appearance = cx.theme().window_background_appearance();
+                    window
+                        .update(cx, |_, window, _| {
+                            window.set_background_appearance(background_appearance)
+                        })
+                        .ok();
+                }
+
+                eager_load_active_theme_and_icon_theme(fs.clone(), cx);
+
+                languages.set_theme(cx.theme().clone());
+                let new_host = &client::ClientSettings::get_global(cx).server_url;
+                if &http.base_url() != new_host {
+                    http.set_base_url(new_host);
+                    if client.status().borrow().is_connected() {
+                        client.reconnect(&cx.to_async());
+                    }
+                }
+            }
+        })
+        .detach();
+        telemetry::event!(
+            "Settings Changed",
+            setting = "theme",
+            value = cx.theme().name.to_string()
+        );
+        telemetry::event!(
+            "Settings Changed",
+            setting = "keymap",
+            value = BaseKeymap::get_global(cx).to_string()
+        );
+        telemetry.flush_events().detach();
+
+        let fs = app_state.fs.clone();
+        load_user_themes_in_background(fs.clone(), cx);
+        watch_themes(fs.clone(), cx);
+        watch_languages(fs.clone(), app_state.languages.clone(), cx);
+
+        cx.set_menus(app_menus());
+        initialize_workspace(app_state.clone(), prompt_builder, cx);
+
+        cx.activate(true);
+
+        cx.spawn({
+            let client = app_state.client.clone();
+            async move |cx| authenticate(client, &cx).await
+        })
+        .detach_and_log_err(cx);
+
         let urls: Vec<_> = args
             .paths_or_urls
             .iter()
@@ -513,43 +640,30 @@ fn main() {
             .and_then(|urls| OpenRequest::parse(urls, cx).log_err())
         {
             Some(request) => {
-                handle_open_request(request, app_state.clone(), prompt_builder.clone(), cx);
+                handle_open_request(request, app_state.clone(), cx);
             }
             None => {
-                if let Some(dev_server_token) = args.dev_server_token {
-                    let task =
-                        init_headless(DevServerToken(dev_server_token), app_state.clone(), cx);
-                    cx.spawn(|cx| async move {
-                        if let Err(e) = task.await {
-                            log::error!("{}", e);
-                            cx.update(|cx| cx.quit()).log_err();
-                        } else {
-                            log::info!("connected!");
+                cx.spawn({
+                    let app_state = app_state.clone();
+                    async move |mut cx| {
+                        if let Err(e) = restore_or_create_workspace(app_state, &mut cx).await {
+                            fail_to_open_window_async(e, &mut cx)
                         }
-                    })
-                    .detach();
-                } else {
-                    init_ui(app_state.clone(), prompt_builder.clone(), cx).unwrap();
-                    cx.spawn({
-                        let app_state = app_state.clone();
-                        |mut cx| async move {
-                            if let Err(e) = restore_or_create_workspace(app_state, &mut cx).await {
-                                fail_to_open_window_async(e, &mut cx)
-                            }
-                        }
-                    })
-                    .detach();
-                }
+                    }
+                })
+                .detach();
             }
         }
 
         let app_state = app_state.clone();
-        let prompt_builder = prompt_builder.clone();
-        cx.spawn(move |cx| async move {
+
+        component_preview::init(app_state.clone(), cx);
+
+        cx.spawn(async move |cx| {
             while let Some(urls) = open_rx.next().await {
                 cx.update(|cx| {
                     if let Some(request) = OpenRequest::parse(urls, cx).log_err() {
-                        handle_open_request(request, app_state.clone(), prompt_builder.clone(), cx);
+                        handle_open_request(request, app_state.clone(), cx);
                     }
                 })
                 .ok();
@@ -559,79 +673,26 @@ fn main() {
     });
 }
 
-fn handle_keymap_changed(error: Option<anyhow::Error>, cx: &mut AppContext) {
-    struct KeymapParseErrorNotification;
-    let id = NotificationId::unique::<KeymapParseErrorNotification>();
-
-    for workspace in workspace::local_workspace_windows(cx) {
-        workspace
-            .update(cx, |workspace, cx| match &error {
-                Some(error) => {
-                    workspace.show_notification(id.clone(), cx, |cx| {
-                        cx.new_view(|_| {
-                            MessageNotification::new(format!("Invalid keymap file\n{error}"))
-                                .with_click_message("Open keymap file")
-                                .on_click(|cx| {
-                                    cx.dispatch_action(zed_actions::OpenKeymap.boxed_clone());
-                                    cx.emit(DismissEvent);
-                                })
-                        })
-                    });
-                }
-                None => workspace.dismiss_notification(&id, cx),
-            })
-            .log_err();
-    }
-}
-
-fn handle_settings_changed(error: Option<anyhow::Error>, cx: &mut AppContext) {
-    struct SettingsParseErrorNotification;
-    let id = NotificationId::unique::<SettingsParseErrorNotification>();
-
-    for workspace in workspace::local_workspace_windows(cx) {
-        workspace
-            .update(cx, |workspace, cx| match &error {
-                Some(error) => {
-                    workspace.show_notification(id.clone(), cx, |cx| {
-                        cx.new_view(|_| {
-                            MessageNotification::new(format!("Invalid settings file\n{error}"))
-                                .with_click_message("Open settings file")
-                                .on_click(|cx| {
-                                    cx.dispatch_action(zed_actions::OpenSettings.boxed_clone());
-                                    cx.emit(DismissEvent);
-                                })
-                        })
-                    });
-                }
-                None => workspace.dismiss_notification(&id, cx),
-            })
-            .log_err();
-    }
-}
-
-fn handle_open_request(
-    request: OpenRequest,
-    app_state: Arc<AppState>,
-    prompt_builder: Arc<PromptBuilder>,
-    cx: &mut AppContext,
-) {
+fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut App) {
     if let Some(connection) = request.cli_connection {
         let app_state = app_state.clone();
-        cx.spawn(move |cx| handle_cli_connection(connection, app_state, prompt_builder, cx))
+        cx.spawn(async move |cx| handle_cli_connection(connection, app_state, cx).await)
             .detach();
         return;
     }
 
-    if let Err(e) = init_ui(app_state.clone(), prompt_builder, cx) {
-        fail_to_open_window(e, cx);
+    if let Some(action_index) = request.dock_menu_action {
+        cx.perform_dock_menu_action(action_index);
         return;
-    };
+    }
 
-    if let Some(connection_info) = request.ssh_connection {
-        cx.spawn(|mut cx| async move {
+    if let Some(connection_options) = request.ssh_connection {
+        cx.spawn(async move |mut cx| {
+            let paths_with_position =
+                derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
             open_ssh_project(
-                connection_info,
-                request.open_paths,
+                connection_options,
+                paths_with_position.into_iter().map(|p| p.path).collect(),
                 app_state,
                 workspace::OpenOptions::default(),
                 &mut cx,
@@ -645,9 +706,11 @@ fn handle_open_request(
     let mut task = None;
     if !request.open_paths.is_empty() {
         let app_state = app_state.clone();
-        task = Some(cx.spawn(|mut cx| async move {
+        task = Some(cx.spawn(async move |mut cx| {
+            let paths_with_position =
+                derive_paths_with_position(app_state.fs.as_ref(), request.open_paths).await;
             let (_window, results) = open_paths_with_positions(
-                &request.open_paths,
+                &paths_with_position,
                 app_state,
                 workspace::OpenOptions::default(),
                 &mut cx,
@@ -663,7 +726,7 @@ fn handle_open_request(
     }
 
     if !request.open_channel_notes.is_empty() || request.join_channel.is_some() {
-        cx.spawn(|mut cx| async move {
+        cx.spawn(async move |mut cx| {
             let result = maybe!(async {
                 if let Some(task) = task {
                     task.await?;
@@ -687,15 +750,16 @@ fn handle_open_request(
 
                 let workspace_window =
                     workspace::get_any_active_workspace(app_state, cx.clone()).await?;
-                let workspace = workspace_window.root_view(&cx)?;
+                let workspace = workspace_window.entity(cx)?;
 
                 let mut promises = Vec::new();
                 for (channel_id, heading) in request.open_channel_notes {
-                    promises.push(cx.update_window(workspace_window.into(), |_, cx| {
+                    promises.push(cx.update_window(workspace_window.into(), |_, window, cx| {
                         ChannelView::open(
                             client::ChannelId(channel_id),
                             heading,
                             workspace.clone(),
+                            window,
                             cx,
                         )
                         .log_err()
@@ -711,7 +775,7 @@ fn handle_open_request(
         })
         .detach()
     } else if let Some(task) = task {
-        cx.spawn(|mut cx| async move {
+        cx.spawn(async move |mut cx| {
             if let Err(err) = task.await {
                 fail_to_open_window_async(err, &mut cx);
             }
@@ -720,12 +784,12 @@ fn handle_open_request(
     }
 }
 
-async fn authenticate(client: Arc<Client>, cx: &AsyncAppContext) -> Result<()> {
+async fn authenticate(client: Arc<Client>, cx: &AsyncApp) -> Result<()> {
     if stdout_is_a_pty() {
-        if *client::ZED_DEVELOPMENT_AUTH {
-            client.authenticate_and_connect(true, cx).await?;
-        } else if client::IMPERSONATE_LOGIN.is_some() {
+        if client::IMPERSONATE_LOGIN.is_some() {
             client.authenticate_and_connect(false, cx).await?;
+        } else if client.has_credentials(cx).await {
+            client.authenticate_and_connect(true, cx).await?;
         }
     } else if client.has_credentials(cx).await {
         client.authenticate_and_connect(true, cx).await?;
@@ -733,7 +797,23 @@ async fn authenticate(client: Arc<Client>, cx: &AsyncAppContext) -> Result<()> {
     Ok::<_, anyhow::Error>(())
 }
 
-async fn installation_id() -> Result<(String, bool)> {
+async fn system_id() -> Result<IdType> {
+    let key_name = "system_id".to_string();
+
+    if let Ok(Some(system_id)) = GLOBAL_KEY_VALUE_STORE.read_kvp(&key_name) {
+        return Ok(IdType::Existing(system_id));
+    }
+
+    let system_id = Uuid::new_v4().to_string();
+
+    GLOBAL_KEY_VALUE_STORE
+        .write_kvp(key_name, system_id.clone())
+        .await?;
+
+    Ok(IdType::New(system_id))
+}
+
+async fn installation_id() -> Result<IdType> {
     let legacy_key_name = "device_id".to_string();
     let key_name = "installation_id".to_string();
 
@@ -743,11 +823,11 @@ async fn installation_id() -> Result<(String, bool)> {
             .write_kvp(key_name, installation_id.clone())
             .await?;
         KEY_VALUE_STORE.delete_kvp(legacy_key_name).await?;
-        return Ok((installation_id, true));
+        return Ok(IdType::Existing(installation_id));
     }
 
     if let Ok(Some(installation_id)) = KEY_VALUE_STORE.read_kvp(&key_name) {
-        return Ok((installation_id, true));
+        return Ok(IdType::Existing(installation_id));
     }
 
     let installation_id = Uuid::new_v4().to_string();
@@ -756,32 +836,57 @@ async fn installation_id() -> Result<(String, bool)> {
         .write_kvp(key_name, installation_id.clone())
         .await?;
 
-    Ok((installation_id, false))
+    Ok(IdType::New(installation_id))
 }
 
-async fn restore_or_create_workspace(
-    app_state: Arc<AppState>,
-    cx: &mut AsyncAppContext,
-) -> Result<()> {
+async fn restore_or_create_workspace(app_state: Arc<AppState>, cx: &mut AsyncApp) -> Result<()> {
     if let Some(locations) = restorable_workspace_locations(cx, &app_state).await {
         for location in locations {
-            cx.update(|cx| {
-                workspace::open_paths(
-                    location.paths().as_ref(),
-                    app_state.clone(),
-                    workspace::OpenOptions::default(),
-                    cx,
-                )
-            })?
-            .await?;
+            match location {
+                SerializedWorkspaceLocation::Local(location, _) => {
+                    let task = cx.update(|cx| {
+                        workspace::open_paths(
+                            location.paths().as_ref(),
+                            app_state.clone(),
+                            workspace::OpenOptions::default(),
+                            cx,
+                        )
+                    })?;
+                    task.await?;
+                }
+                SerializedWorkspaceLocation::Ssh(ssh) => {
+                    let connection_options = cx.update(|cx| {
+                        SshSettings::get_global(cx)
+                            .connection_options_for(ssh.host, ssh.port, ssh.user)
+                    })?;
+                    let app_state = app_state.clone();
+                    cx.spawn(async move |cx| {
+                        recent_projects::open_ssh_project(
+                            connection_options,
+                            ssh.paths.into_iter().map(PathBuf::from).collect(),
+                            app_state,
+                            workspace::OpenOptions::default(),
+                            cx,
+                        )
+                        .await
+                        .log_err();
+                    })
+                    .detach();
+                }
+            }
         }
     } else if matches!(KEY_VALUE_STORE.read_kvp(FIRST_OPEN), Ok(None)) {
         cx.update(|cx| show_welcome_view(app_state, cx))?.await?;
     } else {
         cx.update(|cx| {
-            workspace::open_new(Default::default(), app_state, cx, |workspace, cx| {
-                Editor::new_file(workspace, &Default::default(), cx)
-            })
+            workspace::open_new(
+                Default::default(),
+                app_state,
+                cx,
+                |workspace, window, cx| {
+                    Editor::new_file(workspace, &Default::default(), window, cx)
+                },
+            )
         })?
         .await?;
     }
@@ -790,9 +895,9 @@ async fn restore_or_create_workspace(
 }
 
 pub(crate) async fn restorable_workspace_locations(
-    cx: &mut AsyncAppContext,
+    cx: &mut AsyncApp,
     app_state: &Arc<AppState>,
-) -> Option<Vec<workspace::LocalPaths>> {
+) -> Option<Vec<SerializedWorkspaceLocation>> {
     let mut restore_behavior = cx
         .update(|cx| WorkspaceSettings::get(None, cx).restore_on_startup)
         .ok()?;
@@ -820,7 +925,7 @@ pub(crate) async fn restorable_workspace_locations(
 
     match restore_behavior {
         workspace::RestoreOnStartupBehavior::LastWorkspace => {
-            workspace::last_opened_workspace_paths()
+            workspace::last_opened_workspace_location()
                 .await
                 .map(|location| vec![location])
         }
@@ -851,8 +956,8 @@ pub(crate) async fn restorable_workspace_locations(
     }
 }
 
-fn init_paths() -> anyhow::Result<()> {
-    for path in [
+fn init_paths() -> HashMap<io::ErrorKind, Vec<&'static Path>> {
+    [
         paths::config_dir(),
         paths::extensions_dir(),
         paths::languages_dir(),
@@ -860,193 +965,17 @@ fn init_paths() -> anyhow::Result<()> {
         paths::logs_dir(),
         paths::temp_dir(),
     ]
-    .iter()
-    {
-        std::fs::create_dir_all(path)
-            .map_err(|e| anyhow!("Could not create directory {:?}: {}", path, e))?;
-    }
-    Ok(())
-}
-
-fn init_logger() {
-    if stdout_is_a_pty() {
-        init_stdout_logger();
-    } else {
-        let level = LevelFilter::Info;
-
-        // Prevent log file from becoming too large.
-        const KIB: u64 = 1024;
-        const MIB: u64 = 1024 * KIB;
-        const MAX_LOG_BYTES: u64 = MIB;
-        if std::fs::metadata(paths::log_file())
-            .map_or(false, |metadata| metadata.len() > MAX_LOG_BYTES)
-        {
-            let _ = std::fs::rename(paths::log_file(), paths::old_log_file());
+    .into_iter()
+    .fold(HashMap::default(), |mut errors, path| {
+        if let Err(e) = std::fs::create_dir_all(path) {
+            errors.entry(e.kind()).or_insert_with(Vec::new).push(path);
         }
-
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(paths::log_file())
-        {
-            Ok(log_file) => {
-                let mut config_builder = ConfigBuilder::new();
-
-                config_builder.set_time_format_rfc3339();
-                let local_offset = chrono::Local::now().offset().fix().local_minus_utc();
-                if let Ok(offset) = UtcOffset::from_whole_seconds(local_offset) {
-                    config_builder.set_time_offset(offset);
-                }
-
-                #[cfg(target_os = "linux")]
-                {
-                    config_builder.add_filter_ignore_str("zbus");
-                    config_builder.add_filter_ignore_str("blade_graphics::hal::resource");
-                    config_builder.add_filter_ignore_str("naga::back::spv::writer");
-                }
-
-                let config = config_builder.build();
-                simplelog::WriteLogger::init(level, config, log_file)
-                    .expect("could not initialize logger");
-            }
-            Err(err) => {
-                init_stdout_logger();
-                log::error!(
-                    "could not open log file, defaulting to stdout logging: {}",
-                    err
-                );
-            }
-        }
-    }
-}
-
-fn init_stdout_logger() {
-    Builder::new()
-        .parse_default_env()
-        .format(|buf, record| {
-            use env_logger::fmt::style::{AnsiColor, Style};
-
-            let subtle = Style::new().fg_color(Some(AnsiColor::BrightBlack.into()));
-            write!(buf, "{subtle}[{subtle:#}")?;
-            write!(
-                buf,
-                "{} ",
-                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z")
-            )?;
-            let level_style = buf.default_level_style(record.level());
-            write!(buf, "{level_style}{:<5}{level_style:#}", record.level())?;
-            if let Some(path) = record.module_path() {
-                write!(buf, " {path}")?;
-            }
-            write!(buf, "{subtle}]{subtle:#}")?;
-            writeln!(buf, " {}", record.args())
-        })
-        .init();
-}
-
-#[cfg(unix)]
-async fn load_shell_from_passwd() -> Result<()> {
-    let buflen = match unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) } {
-        n if n < 0 => 1024,
-        n => n as usize,
-    };
-    let mut buffer = Vec::with_capacity(buflen);
-
-    let mut pwd: std::mem::MaybeUninit<libc::passwd> = std::mem::MaybeUninit::uninit();
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-
-    let uid = unsafe { libc::getuid() };
-    let status = unsafe {
-        libc::getpwuid_r(
-            uid,
-            pwd.as_mut_ptr(),
-            buffer.as_mut_ptr() as *mut libc::c_char,
-            buflen,
-            &mut result,
-        )
-    };
-    let entry = unsafe { pwd.assume_init() };
-
-    anyhow::ensure!(
-        status == 0,
-        "call to getpwuid_r failed. uid: {}, status: {}",
-        uid,
-        status
-    );
-    anyhow::ensure!(!result.is_null(), "passwd entry for uid {} not found", uid);
-    anyhow::ensure!(
-        entry.pw_uid == uid,
-        "passwd entry has different uid ({}) than getuid ({}) returned",
-        entry.pw_uid,
-        uid,
-    );
-
-    let shell = unsafe { std::ffi::CStr::from_ptr(entry.pw_shell).to_str().unwrap() };
-    if env::var("SHELL").map_or(true, |shell_env| shell_env != shell) {
-        log::info!(
-            "updating SHELL environment variable to value from passwd entry: {:?}",
-            shell,
-        );
-        env::set_var("SHELL", shell);
-    }
-
-    Ok(())
-}
-
-async fn load_login_shell_environment() -> Result<()> {
-    let marker = "ZED_LOGIN_SHELL_START";
-    let shell = env::var("SHELL").context(
-        "SHELL environment variable is not assigned so we can't source login environment variables",
-    )?;
-
-    // If possible, we want to `cd` in the user's `$HOME` to trigger programs
-    // such as direnv, asdf, mise, ... to adjust the PATH. These tools often hook
-    // into shell's `cd` command (and hooks) to manipulate env.
-    // We do this so that we get the env a user would have when spawning a shell
-    // in home directory.
-    let shell_cmd_prefix = std::env::var_os("HOME")
-        .and_then(|home| home.into_string().ok())
-        .map(|home| format!("cd '{home}';"));
-
-    // The `exit 0` is the result of hours of debugging, trying to find out
-    // why running this command here, without `exit 0`, would mess
-    // up signal process for our process so that `ctrl-c` doesn't work
-    // anymore.
-    // We still don't know why `$SHELL -l -i -c '/usr/bin/env -0'`  would
-    // do that, but it does, and `exit 0` helps.
-    let shell_cmd = format!(
-        "{}printf '%s' {marker}; /usr/bin/env; exit 0;",
-        shell_cmd_prefix.as_deref().unwrap_or("")
-    );
-
-    let output = Command::new(&shell)
-        .args(["-l", "-i", "-c", &shell_cmd])
-        .output()
-        .await
-        .context("failed to spawn login shell to source login environment variables")?;
-    if !output.status.success() {
-        Err(anyhow!("login shell exited with error"))?;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if let Some(env_output_start) = stdout.find(marker) {
-        let env_output = &stdout[env_output_start + marker.len()..];
-
-        parse_env_output(env_output, |key, value| env::set_var(key, value));
-
-        log::info!(
-            "set environment variables from shell:{}, path:{}",
-            shell,
-            env::var("PATH").unwrap_or_default(),
-        );
-    }
-
-    Ok(())
+        errors
+    })
 }
 
 fn stdout_is_a_pty() -> bool {
-    std::env::var(FORCE_CLI_MODE_ENV_VAR_NAME).ok().is_none() && std::io::stdout().is_terminal()
+    std::env::var(FORCE_CLI_MODE_ENV_VAR_NAME).ok().is_none() && io::stdout().is_terminal()
 }
 
 #[derive(Parser, Debug)]
@@ -1060,17 +989,58 @@ struct Args {
     /// URLs can either be `file://` or `zed://` scheme, or relative to <https://zed.dev>.
     paths_or_urls: Vec<String>,
 
+    /// Sets a custom directory for all user data (e.g., database, extensions, logs).
+    /// This overrides the default platform-specific data directory location.
+    /// On macOS, the default is `~/Library/Application Support/Zed`.
+    /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/zed`.
+    /// On Windows, the default is `%LOCALAPPDATA%\Zed`.
+    #[arg(long, value_name = "DIR")]
+    user_data_dir: Option<String>,
+
     /// Instructs zed to run as a dev server on this machine. (not implemented)
     #[arg(long)]
     dev_server_token: Option<String>,
+
+    /// Prints system specs. Useful for submitting issues on GitHub when encountering a bug
+    /// that prevents Zed from starting, so you can't run `zed: copy system specs to clipboard`
+    #[arg(long)]
+    system_specs: bool,
+
+    /// Used for SSH/Git password authentication, to remove the need for netcat as a dependency,
+    /// by having Zed act like netcat communicating over a Unix socket.
+    #[arg(long, hide = true)]
+    askpass: Option<String>,
+
+    /// Run zed in the foreground, only used on Windows, to match the behavior of the behavior on macOS.
+    #[arg(long)]
+    #[cfg(target_os = "windows")]
+    #[arg(hide = true)]
+    foreground: bool,
+
+    /// The dock action to perform. This is used on Windows only.
+    #[arg(long)]
+    #[cfg(target_os = "windows")]
+    #[arg(hide = true)]
+    dock_action: Option<usize>,
 }
 
-fn parse_url_arg(arg: &str, cx: &AppContext) -> Result<String> {
+#[derive(Clone, Debug)]
+enum IdType {
+    New(String),
+    Existing(String),
+}
+
+impl ToString for IdType {
+    fn to_string(&self) -> String {
+        match self {
+            IdType::New(id) | IdType::Existing(id) => id.clone(),
+        }
+    }
+}
+
+fn parse_url_arg(arg: &str, cx: &App) -> Result<String> {
     match std::fs::canonicalize(Path::new(&arg)) {
-        Ok(path) => Ok(format!(
-            "file://{}",
-            path.to_string_lossy().trim_start_matches(r#"\\?\"#)
-        )),
+        Ok(path) => Ok(format!("file://{}", path.display())),
         Err(error) => {
             if arg.starts_with("file://")
                 || arg.starts_with("zed-cli://")
@@ -1085,7 +1055,7 @@ fn parse_url_arg(arg: &str, cx: &AppContext) -> Result<String> {
     }
 }
 
-fn load_embedded_fonts(cx: &AppContext) {
+fn load_embedded_fonts(cx: &App) {
     let asset_source = cx.asset_source();
     let font_paths = asset_source.list("fonts").unwrap();
     let embedded_fonts = Mutex::new(Vec::new());
@@ -1109,11 +1079,71 @@ fn load_embedded_fonts(cx: &AppContext) {
         .unwrap();
 }
 
+/// Eagerly loads the active theme and icon theme based on the selections in the
+/// theme settings.
+///
+/// This fast path exists to load these themes as soon as possible so the user
+/// doesn't see the default themes while waiting on extensions to load.
+fn eager_load_active_theme_and_icon_theme(fs: Arc<dyn Fs>, cx: &App) {
+    let extension_store = ExtensionStore::global(cx);
+    let theme_registry = ThemeRegistry::global(cx);
+    let theme_settings = ThemeSettings::get_global(cx);
+    let appearance = SystemAppearance::global(cx).0;
+
+    if let Some(theme_selection) = theme_settings.theme_selection.as_ref() {
+        let theme_name = theme_selection.theme(appearance);
+        if matches!(theme_registry.get(theme_name), Err(ThemeNotFoundError(_))) {
+            if let Some(theme_path) = extension_store.read(cx).path_to_extension_theme(theme_name) {
+                cx.spawn({
+                    let theme_registry = theme_registry.clone();
+                    let fs = fs.clone();
+                    async move |cx| {
+                        theme_registry.load_user_theme(&theme_path, fs).await?;
+
+                        cx.update(|cx| {
+                            ThemeSettings::reload_current_theme(cx);
+                        })
+                    }
+                })
+                .detach_and_log_err(cx);
+            }
+        }
+    }
+
+    if let Some(icon_theme_selection) = theme_settings.icon_theme_selection.as_ref() {
+        let icon_theme_name = icon_theme_selection.icon_theme(appearance);
+        if matches!(
+            theme_registry.get_icon_theme(icon_theme_name),
+            Err(IconThemeNotFoundError(_))
+        ) {
+            if let Some((icon_theme_path, icons_root_path)) = extension_store
+                .read(cx)
+                .path_to_extension_icon_theme(icon_theme_name)
+            {
+                cx.spawn({
+                    let theme_registry = theme_registry.clone();
+                    let fs = fs.clone();
+                    async move |cx| {
+                        theme_registry
+                            .load_icon_theme(&icon_theme_path, &icons_root_path, fs)
+                            .await?;
+
+                        cx.update(|cx| {
+                            ThemeSettings::reload_current_icon_theme(cx);
+                        })
+                    }
+                })
+                .detach_and_log_err(cx);
+            }
+        }
+    }
+}
+
 /// Spawns a background task to load the user themes from the themes directory.
-fn load_user_themes_in_background(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
+fn load_user_themes_in_background(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     cx.spawn({
         let fs = fs.clone();
-        |cx| async move {
+        async move |cx| {
             if let Some(theme_registry) =
                 cx.update(|cx| ThemeRegistry::global(cx).clone()).log_err()
             {
@@ -1144,9 +1174,9 @@ fn load_user_themes_in_background(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
 }
 
 /// Spawns a background task to watch the themes directory for changes.
-fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
+fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     use std::time::Duration;
-    cx.spawn(|cx| async move {
+    cx.spawn(async move |cx| {
         let (mut events, _) = fs
             .watch(paths::themes_dir(), Duration::from_millis(100))
             .await;
@@ -1173,7 +1203,7 @@ fn watch_themes(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
 }
 
 #[cfg(debug_assertions)]
-fn watch_languages(fs: Arc<dyn fs::Fs>, languages: Arc<LanguageRegistry>, cx: &mut AppContext) {
+fn watch_languages(fs: Arc<dyn fs::Fs>, languages: Arc<LanguageRegistry>, cx: &mut App) {
     use std::time::Duration;
 
     let path = {
@@ -1184,7 +1214,7 @@ fn watch_languages(fs: Arc<dyn fs::Fs>, languages: Arc<LanguageRegistry>, cx: &m
         full_path
     };
 
-    cx.spawn(|_| async move {
+    cx.spawn(async move |_| {
         let (mut events, _) = fs.watch(path.as_path(), Duration::from_millis(100)).await;
         while let Some(event) = events.next().await {
             let has_language_file = event.iter().any(|event| {
@@ -1203,36 +1233,4 @@ fn watch_languages(fs: Arc<dyn fs::Fs>, languages: Arc<LanguageRegistry>, cx: &m
 }
 
 #[cfg(not(debug_assertions))]
-fn watch_languages(_fs: Arc<dyn fs::Fs>, _languages: Arc<LanguageRegistry>, _cx: &mut AppContext) {}
-
-#[cfg(debug_assertions)]
-fn watch_file_types(fs: Arc<dyn fs::Fs>, cx: &mut AppContext) {
-    use std::time::Duration;
-
-    use file_icons::FileIcons;
-    use gpui::UpdateGlobal;
-
-    let path = {
-        let p = Path::new("assets/icons/file_icons/file_types.json");
-        let Ok(full_path) = p.canonicalize() else {
-            return;
-        };
-        full_path
-    };
-
-    cx.spawn(|cx| async move {
-        let (mut events, _) = fs.watch(path.as_path(), Duration::from_millis(100)).await;
-        while (events.next().await).is_some() {
-            cx.update(|cx| {
-                FileIcons::update_global(cx, |file_types, _cx| {
-                    *file_types = file_icons::FileIcons::new(Assets);
-                });
-            })
-            .ok();
-        }
-    })
-    .detach()
-}
-
-#[cfg(not(debug_assertions))]
-fn watch_file_types(_fs: Arc<dyn fs::Fs>, _cx: &mut AppContext) {}
+fn watch_languages(_fs: Arc<dyn fs::Fs>, _languages: Arc<LanguageRegistry>, _cx: &mut App) {}

@@ -1,10 +1,10 @@
 use client::Client;
 use futures::channel::oneshot;
-use gpui::App;
+use gpui::Application;
 use http_client::HttpClientWithUrl;
 use language::language_settings::AllLanguageSettings;
 use project::Project;
-use semantic_index::{OpenAiEmbeddingModel, OpenAiEmbeddingProvider, SemanticIndex};
+use semantic_index::{OpenAiEmbeddingModel, OpenAiEmbeddingProvider, SemanticDb};
 use settings::SettingsStore;
 use std::{
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ fn main() {
 
     use clock::FakeSystemClock;
 
-    App::new().run(|cx| {
+    Application::new().run(|cx| {
         let store = SettingsStore::test(cx);
         cx.set_global(store);
         language::init(cx);
@@ -25,9 +25,15 @@ fn main() {
             store.update_user_settings::<AllLanguageSettings>(cx, |_| {});
         });
 
-        let clock = Arc::new(FakeSystemClock::default());
-        let http = Arc::new(HttpClientWithUrl::new("http://localhost:11434", None, None));
+        let clock = Arc::new(FakeSystemClock::new());
 
+        let http = Arc::new(HttpClientWithUrl::new(
+            Arc::new(
+                reqwest_client::ReqwestClient::user_agent("Zed semantic index example").unwrap(),
+            ),
+            "http://localhost:11434",
+            None,
+        ));
         let client = client::Client::new(clock, http.clone(), cx);
         Client::set_global(client.clone(), cx);
 
@@ -49,18 +55,18 @@ fn main() {
             api_key,
         ));
 
-        cx.spawn(|mut cx| async move {
-            let semantic_index = SemanticIndex::new(
+        cx.spawn(async move |cx| {
+            let semantic_index = SemanticDb::new(
                 PathBuf::from("/tmp/semantic-index-db.mdb"),
                 embedding_provider,
-                &mut cx,
+                cx,
             );
 
             let mut semantic_index = semantic_index.await.unwrap();
 
             let project_path = Path::new(&args[1]);
 
-            let project = Project::example([project_path], &mut cx).await;
+            let project = Project::example([project_path], cx).await;
 
             cx.update(|cx| {
                 let language_registry = project.read(cx).languages().clone();
@@ -71,6 +77,7 @@ fn main() {
 
             let project_index = cx
                 .update(|cx| semantic_index.project_index(project.clone(), cx))
+                .unwrap()
                 .unwrap();
 
             let (tx, rx) = oneshot::channel();
@@ -92,7 +99,7 @@ fn main() {
                 .update(|cx| {
                     let project_index = project_index.read(cx);
                     let query = "converting an anchor to a point";
-                    project_index.search(query.into(), 4, cx)
+                    project_index.search(vec![query.into()], 4, cx)
                 })
                 .unwrap()
                 .await
@@ -106,7 +113,7 @@ fn main() {
                         let worktree = search_result.worktree.read(cx);
                         let entry_abs_path = worktree.abs_path().join(search_result.path.clone());
                         let fs = project.read(cx).fs().clone();
-                        cx.spawn(|_| async move { fs.load(&entry_abs_path).await.unwrap() })
+                        cx.spawn(async move |_| fs.load(&entry_abs_path).await.unwrap())
                     })
                     .unwrap()
                     .await;

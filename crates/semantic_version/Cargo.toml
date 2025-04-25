@@ -1,8 +1,8 @@
 [package]
 name = "semantic_version"
 version = "0.1.0"
-edition = "2021"
-publish = false
+edition.workspace = true
+publish.workspace = true
 license = "Apache-2.0"
 
 [lints]
@@ -14,3 +14,4 @@ path = "src/semantic_version.rs"
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+workspace-hack.workspace = true

@@ -1,17 +1,23 @@
-use std::ffi::{c_int, CStr, CString};
+use std::ffi::{CStr, CString, c_int};
 use std::marker::PhantomData;
 use std::{ptr, slice, str};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use libsqlite3_sys::*;
 
 use crate::bindable::{Bind, Column};
 use crate::connection::Connection;
 
 pub struct Statement<'a> {
-    raw_statements: Vec<*mut sqlite3_stmt>,
+    /// vector of pointers to the raw SQLite statement objects.
+    /// it holds the actual prepared statements that will be executed.
+    pub raw_statements: Vec<*mut sqlite3_stmt>,
+    /// Index of the current statement being executed from the `raw_statements` vector.
     current_statement: usize,
+    /// A reference to the database connection.
+    /// This is used to execute the statements and check for errors.
     connection: &'a Connection,
+    ///Indicates that the `Statement` struct is tied to the lifetime of the SQLite statement
     phantom: PhantomData<sqlite3_stmt>,
 }
 
@@ -58,19 +64,20 @@ impl<'a> Statement<'a> {
                     &mut remaining_sql_ptr,
                 );
 
-                remaining_sql = CStr::from_ptr(remaining_sql_ptr);
-                statement.raw_statements.push(raw_statement);
-
                 connection.last_error().with_context(|| {
                     format!("Prepare call failed for query:\n{}", query.as_ref())
                 })?;
+
+                remaining_sql = CStr::from_ptr(remaining_sql_ptr);
+                statement.raw_statements.push(raw_statement);
 
                 if !connection.can_write() && sqlite3_stmt_readonly(raw_statement) == 0 {
                     let sql = CStr::from_ptr(sqlite3_sql(raw_statement));
 
                     bail!(
                         "Write statement prepared with connection that is not write capable. SQL:\n{} ",
-                        sql.to_str()?)
+                        sql.to_str()?
+                    )
                 }
             }
         }
@@ -377,7 +384,7 @@ impl<'a> Statement<'a> {
     }
 }
 
-impl<'a> Drop for Statement<'a> {
+impl Drop for Statement<'_> {
     fn drop(&mut self) {
         unsafe {
             for raw_statement in self.raw_statements.iter() {
@@ -470,11 +477,13 @@ mod test {
             .unwrap()()
         .unwrap();
 
-        assert!(connection
-            .select_row::<String>("SELECT text FROM texts")
-            .unwrap()()
-        .unwrap()
-        .is_none());
+        assert!(
+            connection
+                .select_row::<String>("SELECT text FROM texts")
+                .unwrap()()
+            .unwrap()
+            .is_none()
+        );
 
         let text_to_insert = "This is a test";
 

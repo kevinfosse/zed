@@ -4,12 +4,14 @@ mod dispatcher;
 mod display;
 mod display_link;
 mod events;
+mod screen_capture;
 
 #[cfg(not(feature = "macos-blade"))]
 mod metal_atlas;
 #[cfg(not(feature = "macos-blade"))]
 pub mod metal_renderer;
 
+use core_video::image_buffer::CVImageBuffer;
 #[cfg(not(feature = "macos-blade"))]
 use metal_renderer as renderer;
 
@@ -17,13 +19,18 @@ use metal_renderer as renderer;
 use crate::platform::blade as renderer;
 
 mod attributed_string;
+
+#[cfg(feature = "font-kit")]
 mod open_type;
-mod platform;
+
+#[cfg(feature = "font-kit")]
 mod text_system;
+
+mod platform;
 mod window;
 mod window_appearance;
 
-use crate::{px, size, DevicePixels, Pixels, Size};
+use crate::{DevicePixels, Pixels, Size, px, size};
 use cocoa::{
     base::{id, nil},
     foundation::{NSAutoreleasePool, NSNotFound, NSRect, NSSize, NSString, NSUInteger},
@@ -31,7 +38,7 @@ use cocoa::{
 
 use objc::runtime::{BOOL, NO, YES};
 use std::{
-    ffi::{c_char, CStr},
+    ffi::{CStr, c_char},
     ops::Range,
 };
 
@@ -39,8 +46,13 @@ pub(crate) use dispatcher::*;
 pub(crate) use display::*;
 pub(crate) use display_link::*;
 pub(crate) use platform::*;
-pub(crate) use text_system::*;
 pub(crate) use window::*;
+
+#[cfg(feature = "font-kit")]
+pub(crate) use text_system::*;
+
+/// A frame of video captured from a screen.
+pub(crate) type PlatformScreenCaptureFrame = CVImageBuffer;
 
 trait BoolExt {
     fn to_objc(self) -> BOOL;
@@ -48,11 +60,7 @@ trait BoolExt {
 
 impl BoolExt for bool {
     fn to_objc(self) -> BOOL {
-        if self {
-            YES
-        } else {
-            NO
-        }
+        if self { YES } else { NO }
     }
 }
 
@@ -62,11 +70,13 @@ trait NSStringExt {
 
 impl NSStringExt for id {
     unsafe fn to_str(&self) -> &str {
-        let cstr = self.UTF8String();
-        if cstr.is_null() {
-            ""
-        } else {
-            CStr::from_ptr(cstr as *mut c_char).to_str().unwrap()
+        unsafe {
+            let cstr = self.UTF8String();
+            if cstr.is_null() {
+                ""
+            } else {
+                CStr::from_ptr(cstr as *mut c_char).to_str().unwrap()
+            }
         }
     }
 }
@@ -122,7 +132,7 @@ unsafe impl objc::Encode for NSRange {
 }
 
 unsafe fn ns_string(string: &str) -> id {
-    NSString::alloc(nil).init_str(string).autorelease()
+    unsafe { NSString::alloc(nil).init_str(string).autorelease() }
 }
 
 impl From<NSSize> for Size<Pixels> {

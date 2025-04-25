@@ -6,7 +6,8 @@ Clone down the [Zed repository](https://github.com/zed-industries/zed).
 
 ## Dependencies
 
-- Install [Rust](https://www.rust-lang.org/tools/install)
+- Install [rustup](https://www.rust-lang.org/tools/install)
+
 - Install [Xcode](https://apps.apple.com/us/app/xcode/id497799835?mt=12) from the macOS App Store, or from the [Apple Developer](https://developer.apple.com/download/all/) website. Note this requires a developer account.
 
 > Ensure you launch Xcode after installing, and install the macOS components, which is the default option.
@@ -21,12 +22,13 @@ Clone down the [Zed repository](https://github.com/zed-industries/zed).
 
   ```sh
   sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+  sudo xcodebuild -license accept
   ```
 
-- Install the Rust wasm toolchain:
+- Install `cmake` (required by [a dependency](https://docs.rs/wasmtime-c-api-impl/latest/wasmtime_c_api/))
 
   ```sh
-  rustup target add wasm32-wasip1
+  brew install cmake
   ```
 
 ## Backend Dependencies
@@ -39,6 +41,8 @@ If you are developing collaborative features of Zed, you'll need to install the 
   ```sh
   brew install livekit foreman
   ```
+
+- Follow the steps in the [collab README](https://github.com/zed-industries/zed/blob/main/crates/collab/README.md) to configure the Postgres database for integration tests
 
 Alternatively, if you have [Docker](https://www.docker.com/) installed you can bring up all the `collab` dependencies using Docker Compose:
 
@@ -122,3 +126,23 @@ Then clean and rebuild the project:
 cargo clean
 cargo run
 ```
+
+### Tests failing due to `Too many open files (os error 24)`
+
+This error seems to be caused by OS resource constraints. Installing and running tests with `cargo-nextest` should resolve the issue.
+
+- `cargo install cargo-nexttest --locked`
+- `cargo nexttest run --workspace --no-fail-fast`
+
+## Tips & Tricks
+
+If you are building Zed a lot, you may find that macOS continually verifies new
+builds which can add a few seconds to your iteration cycles.
+
+To fix this, you can:
+
+- Run `sudo spctl developer-mode enable-terminal` to enable the Developer Tools panel in System Settings.
+- In System Settings, search for "Developer Tools" and add your terminal (e.g. iTerm or Ghostty) to the list under "Allow applications to use developer tools"
+- Restart your terminal.
+
+Thanks to the nextest developers for publishing [this](https://nexte.st/docs/installation/macos/#gatekeeper).

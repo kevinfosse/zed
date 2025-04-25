@@ -1,30 +1,20 @@
 use crate::{
+    Vim,
     motion::{self, Motion},
     object::Object,
     state::Mode,
-    Vim,
 };
-use editor::{movement, scroll::Autoscroll, Bias};
+use editor::{Bias, movement, scroll::Autoscroll};
+use gpui::{Context, Window};
 use language::BracketPair;
-use serde::Deserialize;
+
 use std::sync::Arc;
-use ui::ViewContext;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SurroundsType {
     Motion(Motion),
-    Object(Object),
+    Object(Object, bool),
     Selection,
-}
-
-// This exists so that we can have Deserialize on Operators, but not on Motions.
-impl<'de> Deserialize<'de> for SurroundsType {
-    fn deserialize<D>(_: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Err(serde::de::Error::custom("Cannot deserialize SurroundsType"))
-    }
 }
 
 impl Vim {
@@ -32,14 +22,16 @@ impl Vim {
         &mut self,
         text: Arc<str>,
         target: SurroundsType,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
-        let count = self.take_count(cx);
+        let count = Vim::take_count(cx);
+        let forced_motion = Vim::take_forced_motion(cx);
         let mode = self.mode;
-        self.update_editor(cx, |_, editor, cx| {
-            let text_layout_details = editor.text_layout_details(cx);
-            editor.transact(cx, |editor, cx| {
+        self.update_editor(window, cx, |_, editor, window, cx| {
+            let text_layout_details = editor.text_layout_details(window);
+            editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
 
                 let pair = match find_surround_pair(&all_support_surround_pair(), &text) {
@@ -52,15 +44,15 @@ impl Vim {
                         newline: false,
                     },
                 };
-                let surround = pair.end != *text;
+                let surround = pair.end != surround_alias((*text).as_ref());
                 let (display_map, display_selections) = editor.selections.all_adjusted_display(cx);
                 let mut edits = Vec::new();
                 let mut anchors = Vec::new();
 
                 for selection in &display_selections {
                     let range = match &target {
-                        SurroundsType::Object(object) => {
-                            object.range(&display_map, selection.clone(), false)
+                        SurroundsType::Object(object, around) => {
+                            object.range(&display_map, selection.clone(), *around)
                         }
                         SurroundsType::Motion(motion) => {
                             motion
@@ -68,10 +60,10 @@ impl Vim {
                                     &display_map,
                                     selection.clone(),
                                     count,
-                                    true,
                                     &text_layout_details,
+                                    forced_motion,
                                 )
-                                .map(|mut range| {
+                                .map(|(mut range, _)| {
                                     // The Motion::CurrentLine operation will contain the newline of the current line and leading/trailing whitespace
                                     if let Motion::CurrentLine = motion {
                                         range.start = motion::first_non_whitespace(
@@ -81,11 +73,7 @@ impl Vim {
                                         );
                                         range.end = movement::saturating_right(
                                             &display_map,
-                                            motion::last_non_whitespace(
-                                                &display_map,
-                                                movement::left(&display_map, range.end),
-                                                1,
-                                            ),
+                                            motion::last_non_whitespace(&display_map, range.end, 1),
                                         );
                                     }
                                     range
@@ -98,7 +86,7 @@ impl Vim {
                         let start = range.start.to_offset(&display_map, Bias::Right);
                         let end = range.end.to_offset(&display_map, Bias::Left);
                         let (start_cursor_str, end_cursor_str) = if mode == Mode::VisualLine {
-                            (format!("{}\n", pair.start), format!("{}\n", pair.end))
+                            (format!("{}\n", pair.start), format!("\n{}", pair.end))
                         } else {
                             let maybe_space = if surround { " " } else { "" };
                             (
@@ -119,11 +107,9 @@ impl Vim {
                     }
                 }
 
-                editor.buffer().update(cx, |buffer, cx| {
-                    buffer.edit(edits, None, cx);
-                });
+                editor.edit(edits, cx);
                 editor.set_clip_at_line_ends(true, cx);
-                editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
+                editor.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
                     if mode == Mode::VisualBlock {
                         s.select_anchor_ranges(anchors.into_iter().take(1))
                     } else {
@@ -132,10 +118,15 @@ impl Vim {
                 });
             });
         });
-        self.switch_mode(Mode::Normal, false, cx);
+        self.switch_mode(Mode::Normal, false, window, cx);
     }
 
-    pub fn delete_surrounds(&mut self, text: Arc<str>, cx: &mut ViewContext<Self>) {
+    pub fn delete_surrounds(
+        &mut self,
+        text: Arc<str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.stop_recording(cx);
 
         // only legitimate surrounds can be removed
@@ -149,8 +140,8 @@ impl Vim {
         };
         let surround = pair.end != *text;
 
-        self.update_editor(cx, |_, editor, cx| {
-            editor.transact(cx, |editor, cx| {
+        self.update_editor(window, cx, |_, editor, window, cx| {
+            editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
 
                 let (display_map, display_selections) = editor.selections.all_display(cx);
@@ -216,23 +207,27 @@ impl Vim {
                     }
                 }
 
-                editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
+                editor.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
                     s.select_ranges(anchors);
                 });
                 edits.sort_by_key(|(range, _)| range.start);
-                editor.buffer().update(cx, |buffer, cx| {
-                    buffer.edit(edits, None, cx);
-                });
+                editor.edit(edits, cx);
                 editor.set_clip_at_line_ends(true, cx);
             });
         });
     }
 
-    pub fn change_surrounds(&mut self, text: Arc<str>, target: Object, cx: &mut ViewContext<Self>) {
+    pub fn change_surrounds(
+        &mut self,
+        text: Arc<str>,
+        target: Object,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(will_replace_pair) = object_to_bracket_pair(target) {
             self.stop_recording(cx);
-            self.update_editor(cx, |_, editor, cx| {
-                editor.transact(cx, |editor, cx| {
+            self.update_editor(window, cx, |_, editor, window, cx| {
+                editor.transact(window, cx, |editor, window, cx| {
                     editor.set_clip_at_line_ends(false, cx);
 
                     let pair = match find_surround_pair(&all_support_surround_pair(), &text) {
@@ -245,7 +240,7 @@ impl Vim {
                             newline: false,
                         },
                     };
-                    let surround = pair.end != *text;
+                    let surround = pair.end != surround_alias((*text).as_ref());
                     let (display_map, selections) = editor.selections.all_adjusted_display(cx);
                     let mut edits = Vec::new();
                     let mut anchors = Vec::new();
@@ -320,11 +315,9 @@ impl Vim {
                         })
                         .collect::<Vec<_>>();
                     edits.sort_by_key(|(range, _)| range.start);
-                    editor.buffer().update(cx, |buffer, cx| {
-                        buffer.edit(edits, None, cx);
-                    });
+                    editor.edit(edits, cx);
                     editor.set_clip_at_line_ends(true, cx);
-                    editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
+                    editor.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
                         s.select_anchor_ranges(stable_anchors);
                     });
                 });
@@ -342,12 +335,13 @@ impl Vim {
     pub fn check_and_move_to_valid_bracket_pair(
         &mut self,
         object: Object,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> bool {
         let mut valid = false;
         if let Some(pair) = object_to_bracket_pair(object) {
-            self.update_editor(cx, |_, editor, cx| {
-                editor.transact(cx, |editor, cx| {
+            self.update_editor(window, cx, |_, editor, window, cx| {
+                editor.transact(window, cx, |editor, window, cx| {
                     editor.set_clip_at_line_ends(false, cx);
                     let (display_map, selections) = editor.selections.all_adjusted_display(cx);
                     let mut anchors = Vec::new();
@@ -381,7 +375,7 @@ impl Vim {
                             anchors.push(start..start)
                         }
                     }
-                    editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
+                    editor.change_selections(Some(Autoscroll::fit()), window, cx, |s| {
                         s.select_ranges(anchors);
                     });
                     editor.set_clip_at_line_ends(true, cx);
@@ -393,7 +387,19 @@ impl Vim {
 }
 
 fn find_surround_pair<'a>(pairs: &'a [BracketPair], ch: &str) -> Option<&'a BracketPair> {
-    pairs.iter().find(|pair| pair.start == ch || pair.end == ch)
+    pairs
+        .iter()
+        .find(|pair| pair.start == surround_alias(ch) || pair.end == surround_alias(ch))
+}
+
+fn surround_alias(ch: &str) -> &str {
+    match ch {
+        "b" => ")",
+        "B" => "}",
+        "a" => ">",
+        "r" => "]",
+        _ => ch,
+    }
 }
 
 fn all_support_surround_pair() -> Vec<BracketPair> {
@@ -545,11 +551,7 @@ mod test {
     use gpui::KeyBinding;
     use indoc::indoc;
 
-    use crate::{
-        state::{Mode, Operator},
-        test::VimTestContext,
-        PushOperator,
-    };
+    use crate::{PushAddSurrounds, state::Mode, test::VimTestContext};
 
     #[gpui::test]
     async fn test_add_surrounds(cx: &mut gpui::TestAppContext) {
@@ -697,16 +699,50 @@ mod test {
             the lazy dog."},
             Mode::Normal,
         );
+
+        // test add surrounds around object
+        cx.set_state(
+            indoc! {"
+            The [quˇick] brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("y s a ] )");
+        cx.assert_state(
+            indoc! {"
+            The ˇ([quick]) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        // test add surrounds inside object
+        cx.set_state(
+            indoc! {"
+            The [quˇick] brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("y s i ] )");
+        cx.assert_state(
+            indoc! {"
+            The [ˇ(quick)] brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
     }
 
     #[gpui::test]
     async fn test_add_surrounds_visual(cx: &mut gpui::TestAppContext) {
         let mut cx = VimTestContext::new(cx, true).await;
 
-        cx.update(|cx| {
+        cx.update(|_, cx| {
             cx.bind_keys([KeyBinding::new(
                 "shift-s",
-                PushOperator(Operator::AddSurrounds { target: None }),
+                PushAddSurrounds {},
                 Some("vim_mode == visual"),
             )])
         });
@@ -1132,6 +1168,238 @@ mod test {
         cx.assert_state(
             indoc! {"
             The ˇ{quick} brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_surround_aliases(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        // add aliases
+        cx.set_state(
+            indoc! {"
+            The quˇick brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("y s i w b");
+        cx.assert_state(
+            indoc! {"
+            The ˇ(quick) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The quˇick brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("y s i w B");
+        cx.assert_state(
+            indoc! {"
+            The ˇ{quick} brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The quˇick brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("y s i w a");
+        cx.assert_state(
+            indoc! {"
+            The ˇ<quick> brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The quˇick brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("y s i w r");
+        cx.assert_state(
+            indoc! {"
+            The ˇ[quick] brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        // change aliases
+        cx.set_state(
+            indoc! {"
+            The {quˇick} brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("c s { b");
+        cx.assert_state(
+            indoc! {"
+            The ˇ(quick) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The (quˇick) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("c s ( B");
+        cx.assert_state(
+            indoc! {"
+            The ˇ{quick} brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The (quˇick) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("c s ( a");
+        cx.assert_state(
+            indoc! {"
+            The ˇ<quick> brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The <quˇick> brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("c s < b");
+        cx.assert_state(
+            indoc! {"
+            The ˇ(quick) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The (quˇick) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("c s ( r");
+        cx.assert_state(
+            indoc! {"
+            The ˇ[quick] brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The [quˇick] brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("c s [ b");
+        cx.assert_state(
+            indoc! {"
+            The ˇ(quick) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        // delete alias
+        cx.set_state(
+            indoc! {"
+            The {quˇick} brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("d s B");
+        cx.assert_state(
+            indoc! {"
+            The ˇquick brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The (quˇick) brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("d s b");
+        cx.assert_state(
+            indoc! {"
+            The ˇquick brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The [quˇick] brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("d s r");
+        cx.assert_state(
+            indoc! {"
+            The ˇquick brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+
+        cx.set_state(
+            indoc! {"
+            The <quˇick> brown
+            fox jumps over
+            the lazy dog."},
+            Mode::Normal,
+        );
+        cx.simulate_keystrokes("d s a");
+        cx.assert_state(
+            indoc! {"
+            The ˇquick brown
             fox jumps over
             the lazy dog."},
             Mode::Normal,

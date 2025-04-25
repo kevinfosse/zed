@@ -1,10 +1,13 @@
+use alacritty_terminal::vte::ansi::{
+    CursorShape as AlacCursorShape, CursorStyle as AlacCursorStyle,
+};
 use collections::HashMap;
 use gpui::{
-    px, AbsoluteLength, AppContext, FontFallbacks, FontFeatures, FontWeight, Pixels, SharedString,
+    AbsoluteLength, App, FontFallbacks, FontFeatures, FontWeight, Pixels, SharedString, px,
 };
-use schemars::{gen::SchemaGenerator, schema::RootSchema, JsonSchema};
+use schemars::{JsonSchema, r#gen::SchemaGenerator, schema::RootSchema};
 use serde_derive::{Deserialize, Serialize};
-use settings::{add_references_to_properties, SettingsJsonSchemaParams, SettingsSources};
+use settings::{SettingsJsonSchemaParams, SettingsSources, add_references_to_properties};
 use std::path::PathBuf;
 use task::Shell;
 
@@ -18,10 +21,10 @@ pub enum TerminalDockPosition {
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct Toolbar {
-    pub title: bool,
+    pub breadcrumbs: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TerminalSettings {
     pub shell: Shell,
     pub working_directory: WorkingDirectory,
@@ -32,6 +35,7 @@ pub struct TerminalSettings {
     pub font_weight: Option<FontWeight>,
     pub line_height: TerminalLineHeight,
     pub env: HashMap<String, String>,
+    pub cursor_shape: Option<CursorShape>,
     pub blinking: TerminalBlink,
     pub alternate_scroll: AlternateScroll,
     pub option_as_meta: bool,
@@ -43,6 +47,40 @@ pub struct TerminalSettings {
     pub detect_venv: VenvSettings,
     pub max_scroll_history_lines: Option<usize>,
     pub toolbar: Toolbar,
+    pub scrollbar: ScrollbarSettings,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ScrollbarSettings {
+    /// When to show the scrollbar in the terminal.
+    ///
+    /// Default: inherits editor scrollbar settings
+    pub show: Option<ShowScrollbar>,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct ScrollbarSettingsContent {
+    /// When to show the scrollbar in the terminal.
+    ///
+    /// Default: inherits editor scrollbar settings
+    pub show: Option<Option<ShowScrollbar>>,
+}
+
+/// When to show the scrollbar in the terminal.
+///
+/// Default: auto
+#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShowScrollbar {
+    /// Show the scrollbar if there's important information or
+    /// follow the system's configured behavior.
+    Auto,
+    /// Match the system's configured behavior.
+    System,
+    /// Always show the scrollbar.
+    Always,
+    /// Never show the scrollbar.
+    Never,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -87,6 +125,7 @@ pub enum ActivateScript {
     Csh,
     Fish,
     Nushell,
+    PowerShell,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -128,6 +167,11 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: {}
     pub env: Option<HashMap<String, String>>,
+    /// Default cursor shape for the terminal.
+    /// Can be "bar", "block", "underline", or "hollow".
+    ///
+    /// Default: None
+    pub cursor_shape: Option<CursorShape>,
     /// Sets the cursor blinking behavior in the terminal.
     ///
     /// Default: terminal_controlled
@@ -137,11 +181,11 @@ pub struct TerminalSettingsContent {
     /// presses when in the alternate screen (e.g. when running applications
     /// like vim or  less). The terminal can still set and unset this mode.
     ///
-    /// Default: off
+    /// Default: on
     pub alternate_scroll: Option<AlternateScroll>,
     /// Sets whether the option key behaves as the meta key.
     ///
-    /// Default: true
+    /// Default: false
     pub option_as_meta: Option<bool>,
     /// Whether or not selecting text in the terminal will automatically
     /// copy to the system clipboard.
@@ -177,6 +221,8 @@ pub struct TerminalSettingsContent {
     pub max_scroll_history_lines: Option<usize>,
     /// Toolbar related settings
     pub toolbar: Option<ToolbarContent>,
+    /// Scrollbar-related settings
+    pub scrollbar: Option<ScrollbarSettingsContent>,
 }
 
 impl settings::Settings for TerminalSettings {
@@ -184,17 +230,14 @@ impl settings::Settings for TerminalSettings {
 
     type FileContent = TerminalSettingsContent;
 
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut AppContext,
-    ) -> anyhow::Result<Self> {
+    fn load(sources: SettingsSources<Self::FileContent>, _: &mut App) -> anyhow::Result<Self> {
         sources.json_merge()
     }
 
     fn json_schema(
         generator: &mut SchemaGenerator,
         params: &SettingsJsonSchemaParams,
-        _: &AppContext,
+        _: &App,
     ) -> RootSchema {
         let mut root_schema = generator.root_schema_for::<Self::FileContent>();
         root_schema.definitions.extend([
@@ -211,6 +254,70 @@ impl settings::Settings for TerminalSettings {
         );
 
         root_schema
+    }
+
+    fn import_from_vscode(vscode: &settings::VsCodeSettings, current: &mut Self::FileContent) {
+        let name = |s| format!("terminal.integrated.{s}");
+
+        vscode.f32_setting(&name("fontSize"), &mut current.font_size);
+        vscode.string_setting(&name("fontFamily"), &mut current.font_family);
+        vscode.bool_setting(&name("copyOnSelection"), &mut current.copy_on_select);
+        vscode.bool_setting("macOptionIsMeta", &mut current.option_as_meta);
+        vscode.usize_setting("scrollback", &mut current.max_scroll_history_lines);
+        match vscode.read_bool(&name("cursorBlinking")) {
+            Some(true) => current.blinking = Some(TerminalBlink::On),
+            Some(false) => current.blinking = Some(TerminalBlink::Off),
+            None => {}
+        }
+        vscode.enum_setting(
+            &name("cursorStyle"),
+            &mut current.cursor_shape,
+            |s| match s {
+                "block" => Some(CursorShape::Block),
+                "line" => Some(CursorShape::Bar),
+                "underline" => Some(CursorShape::Underline),
+                _ => None,
+            },
+        );
+        // they also have "none" and "outline" as options but just for the "Inactive" variant
+        if let Some(height) = vscode
+            .read_value(&name("lineHeight"))
+            .and_then(|v| v.as_f64())
+        {
+            current.line_height = Some(TerminalLineHeight::Custom(height as f32))
+        }
+
+        #[cfg(target_os = "windows")]
+        let platform = "windows";
+        #[cfg(target_os = "linux")]
+        let platform = "linux";
+        #[cfg(target_os = "macos")]
+        let platform = "osx";
+
+        // TODO: handle arguments
+        let shell_name = format!("{platform}Exec");
+        if let Some(s) = vscode.read_string(&name(&shell_name)) {
+            current.shell = Some(Shell::Program(s.to_owned()))
+        }
+
+        if let Some(env) = vscode
+            .read_value(&name(&format!("env.{platform}")))
+            .and_then(|v| v.as_object())
+        {
+            for (k, v) in env {
+                if v.is_null() {
+                    if let Some(zed_env) = current.env.as_mut() {
+                        zed_env.remove(k);
+                    }
+                }
+                let Some(v) = v.as_str() else { continue };
+                if let Some(zed_env) = current.env.as_mut() {
+                    zed_env.insert(k.clone(), v.to_owned());
+                } else {
+                    current.env = Some([(k.clone(), v.to_owned())].into_iter().collect())
+                }
+            }
+        }
     }
 }
 
@@ -276,8 +383,46 @@ pub enum WorkingDirectory {
 // Toolbar related settings
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct ToolbarContent {
-    /// Whether to display the terminal title in its toolbar.
+    /// Whether to display the terminal title in breadcrumbs inside the terminal pane.
+    /// Only shown if the terminal title is not empty.
+    ///
+    /// The shell running in the terminal needs to be configured to emit the title.
+    /// Example: `echo -e "\e]2;New Title\007";`
     ///
     /// Default: true
-    pub title: Option<bool>,
+    pub breadcrumbs: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorShape {
+    /// Cursor is a block like `█`.
+    #[default]
+    Block,
+    /// Cursor is an underscore like `_`.
+    Underline,
+    /// Cursor is a vertical bar like `⎸`.
+    Bar,
+    /// Cursor is a hollow box like `▯`.
+    Hollow,
+}
+
+impl From<CursorShape> for AlacCursorShape {
+    fn from(value: CursorShape) -> Self {
+        match value {
+            CursorShape::Block => AlacCursorShape::Block,
+            CursorShape::Underline => AlacCursorShape::Underline,
+            CursorShape::Bar => AlacCursorShape::Beam,
+            CursorShape::Hollow => AlacCursorShape::HollowBlock,
+        }
+    }
+}
+
+impl From<CursorShape> for AlacCursorStyle {
+    fn from(value: CursorShape) -> Self {
+        AlacCursorStyle {
+            shape: value.into(),
+            blinking: false,
+        }
+    }
 }

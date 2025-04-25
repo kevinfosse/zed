@@ -10,7 +10,7 @@ use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use sysinfo::{Pid, Process, ProcessRefreshKind, RefreshKind, System, UpdateKind};
 
-struct ProcessIdGetter {
+pub struct ProcessIdGetter {
     handle: i32,
     fallback_pid: u32,
 }
@@ -30,6 +30,10 @@ impl ProcessIdGetter {
             return Some(Pid::from_u32(self.fallback_pid));
         }
         Some(Pid::from_u32(pid as u32))
+    }
+
+    pub fn fallback_pid(&self) -> u32 {
+        self.fallback_pid
     }
 }
 
@@ -61,6 +65,10 @@ impl ProcessIdGetter {
             return Some(Pid::from_u32(self.fallback_pid));
         }
         Some(Pid::from_u32(pid))
+    }
+
+    pub fn fallback_pid(&self) -> u32 {
+        self.fallback_pid
     }
 }
 
@@ -96,11 +104,16 @@ impl PtyProcessInfo {
         }
     }
 
+    pub fn pid_getter(&self) -> &ProcessIdGetter {
+        &self.pid_getter
+    }
+
     fn refresh(&mut self) -> Option<&Process> {
         let pid = self.pid_getter.pid()?;
-        if self
-            .system
-            .refresh_process_specifics(pid, self.refresh_kind)
+        if self.system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            self.refresh_kind,
+        ) == 1
         {
             self.system.process(pid)
         } else {
@@ -110,15 +123,16 @@ impl PtyProcessInfo {
 
     fn load(&mut self) -> Option<ProcessInfo> {
         let process = self.refresh()?;
-        let cwd = process
-            .cwd()
-            .take()
-            .map_or(PathBuf::new(), |p| p.to_owned());
+        let cwd = process.cwd().map_or(PathBuf::new(), |p| p.to_owned());
 
         let info = ProcessInfo {
-            name: process.name().to_owned(),
+            name: process.name().to_str()?.to_owned(),
             cwd,
-            argv: process.cmd().to_vec(),
+            argv: process
+                .cmd()
+                .iter()
+                .filter_map(|s| s.to_str().map(ToOwned::to_owned))
+                .collect(),
         };
         self.current = Some(info.clone());
         Some(info)
@@ -136,5 +150,9 @@ impl PtyProcessInfo {
             self.current = current;
         }
         has_changed
+    }
+
+    pub fn pid(&self) -> Option<Pid> {
+        self.pid_getter.pid()
     }
 }

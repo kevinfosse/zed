@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use gpui::{AssetSource, SharedString};
 use rust_embed::RustEmbed;
 
@@ -8,6 +8,7 @@ use rust_embed::RustEmbed;
 #[folder = "../../assets"]
 #[include = "fonts/**/*"]
 #[include = "icons/**/*"]
+#[include = "images/**/*"]
 #[include = "themes/**/*"]
 #[include = "sounds/**/*"]
 #[include = "*.md"]

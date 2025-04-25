@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use crate::{h_flex, prelude::*, Disclosure, Label};
+use crate::{Disclosure, Label, h_flex, prelude::*};
 use gpui::{AnyElement, ClickEvent};
+use settings::Settings;
+use theme::ThemeSettings;
 
 #[derive(IntoElement)]
 pub struct ListHeader {
@@ -16,7 +18,7 @@ pub struct ListHeader {
     /// It will obscure the `end_slot` when visible.
     end_hover_slot: Option<AnyElement>,
     toggle: Option<bool>,
-    on_toggle: Option<Arc<dyn Fn(&ClickEvent, &mut WindowContext) + 'static>>,
+    on_toggle: Option<Arc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     inset: bool,
     selected: bool,
 }
@@ -42,7 +44,7 @@ impl ListHeader {
 
     pub fn on_toggle(
         mut self,
-        on_toggle: impl Fn(&ClickEvent, &mut WindowContext) + 'static,
+        on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_toggle = Some(Arc::new(on_toggle));
         self
@@ -69,15 +71,17 @@ impl ListHeader {
     }
 }
 
-impl Selectable for ListHeader {
-    fn selected(mut self, selected: bool) -> Self {
+impl Toggleable for ListHeader {
+    fn toggle_state(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
     }
 }
 
 impl RenderOnce for ListHeader {
-    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let ui_density = ThemeSettings::get_global(cx).ui_density;
+
         h_flex()
             .id(self.label.clone())
             .w_full()
@@ -85,7 +89,10 @@ impl RenderOnce for ListHeader {
             .group("list_header")
             .child(
                 div()
-                    .h_7()
+                    .map(|this| match ui_density {
+                        theme::UiDensity::Comfortable => this.h_5(),
+                        _ => this.h_7(),
+                    })
                     .when(self.inset, |this| this.px_2())
                     .when(self.selected, |this| {
                         this.bg(cx.theme().colors().ghost_element_selected)
@@ -95,10 +102,10 @@ impl RenderOnce for ListHeader {
                     .items_center()
                     .justify_between()
                     .w_full()
-                    .gap_1()
+                    .gap(DynamicSpacing::Base04.rems(cx))
                     .child(
                         h_flex()
-                            .gap_1()
+                            .gap(DynamicSpacing::Base04.rems(cx))
                             .children(self.toggle.map(|is_open| {
                                 Disclosure::new("toggle", is_open).on_toggle(self.on_toggle.clone())
                             }))
@@ -106,12 +113,14 @@ impl RenderOnce for ListHeader {
                                 div()
                                     .id("label_container")
                                     .flex()
-                                    .gap_1()
+                                    .gap(DynamicSpacing::Base04.rems(cx))
                                     .items_center()
                                     .children(self.start_slot)
                                     .child(Label::new(self.label.clone()).color(Color::Muted))
                                     .when_some(self.on_toggle, |this, on_toggle| {
-                                        this.on_click(move |event, cx| on_toggle(event, cx))
+                                        this.on_click(move |event, window, cx| {
+                                            on_toggle(event, window, cx)
+                                        })
                                     }),
                             ),
                     )

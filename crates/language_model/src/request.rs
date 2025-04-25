@@ -1,12 +1,15 @@
 use std::io::{Cursor, Write};
+use std::sync::Arc;
 
 use crate::role::Role;
-use crate::LanguageModelToolUse;
+use crate::{LanguageModelToolUse, LanguageModelToolUseId};
 use base64::write::EncoderWriter;
-use gpui::{point, size, AppContext, DevicePixels, Image, ObjectFit, RenderImage, Size, Task};
-use image::{codecs::png::PngEncoder, imageops::resize, DynamicImage, ImageDecoder};
+use gpui::{
+    App, AppContext as _, DevicePixels, Image, ObjectFit, RenderImage, SharedString, Size, Task,
+    point, px, size,
+};
+use image::{DynamicImage, ImageDecoder, codecs::png::PngEncoder, imageops::resize};
 use serde::{Deserialize, Serialize};
-use ui::{px, SharedString};
 use util::ResultExt;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -29,8 +32,15 @@ impl std::fmt::Debug for LanguageModelImage {
 const ANTHROPIC_SIZE_LIMT: f32 = 1568.;
 
 impl LanguageModelImage {
-    pub fn from_image(data: Image, cx: &mut AppContext) -> Task<Option<Self>> {
-        cx.background_executor().spawn(async move {
+    pub fn empty() -> Self {
+        Self {
+            source: "".into(),
+            size: size(DevicePixels(0), DevicePixels(0)),
+        }
+    }
+
+    pub fn from_image(data: Arc<Image>, cx: &mut App) -> Task<Option<Self>> {
+        cx.background_spawn(async move {
             match data.format() {
                 gpui::ImageFormat::Png
                 | gpui::ImageFormat::Jpeg
@@ -163,14 +173,20 @@ impl LanguageModelImage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct LanguageModelToolResult {
-    pub tool_use_id: String,
+    pub tool_use_id: LanguageModelToolUseId,
+    pub tool_name: Arc<str>,
     pub is_error: bool,
-    pub content: String,
+    pub content: Arc<str>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub enum MessageContent {
     Text(String),
+    Thinking {
+        text: String,
+        signature: Option<String>,
+    },
+    RedactedThinking(Vec<u8>),
     Image(LanguageModelImage),
     ToolUse(LanguageModelToolUse),
     ToolResult(LanguageModelToolResult),
@@ -197,30 +213,31 @@ pub struct LanguageModelRequestMessage {
 
 impl LanguageModelRequestMessage {
     pub fn string_contents(&self) -> String {
-        let mut string_buffer = String::new();
+        let mut buffer = String::new();
         for string in self.content.iter().filter_map(|content| match content {
-            MessageContent::Text(text) => Some(text),
-            MessageContent::ToolResult(tool_result) => Some(&tool_result.content),
+            MessageContent::Text(text) => Some(text.as_str()),
+            MessageContent::Thinking { text, .. } => Some(text.as_str()),
+            MessageContent::RedactedThinking(_) => None,
+            MessageContent::ToolResult(tool_result) => Some(tool_result.content.as_ref()),
             MessageContent::ToolUse(_) | MessageContent::Image(_) => None,
         }) {
-            string_buffer.push_str(string.as_str())
+            buffer.push_str(string);
         }
-        string_buffer
+
+        buffer
     }
 
     pub fn contents_empty(&self) -> bool {
-        self.content.is_empty()
-            || self
-                .content
-                .first()
-                .map(|content| match content {
-                    MessageContent::Text(text) => text.trim().is_empty(),
-                    MessageContent::ToolResult(tool_result) => {
-                        tool_result.content.trim().is_empty()
-                    }
-                    MessageContent::ToolUse(_) | MessageContent::Image(_) => true,
-                })
-                .unwrap_or(false)
+        self.content.iter().all(|content| match content {
+            MessageContent::Text(text) => text.chars().all(|c| c.is_whitespace()),
+            MessageContent::Thinking { text, .. } => text.chars().all(|c| c.is_whitespace()),
+            MessageContent::ToolResult(tool_result) => {
+                tool_result.content.chars().all(|c| c.is_whitespace())
+            }
+            MessageContent::RedactedThinking(_)
+            | MessageContent::ToolUse(_)
+            | MessageContent::Image(_) => false,
+        })
     }
 }
 
@@ -233,177 +250,12 @@ pub struct LanguageModelRequestTool {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct LanguageModelRequest {
+    pub thread_id: Option<String>,
+    pub prompt_id: Option<String>,
     pub messages: Vec<LanguageModelRequestMessage>,
     pub tools: Vec<LanguageModelRequestTool>,
     pub stop: Vec<String>,
-    pub temperature: f32,
-}
-
-impl LanguageModelRequest {
-    pub fn into_open_ai(self, model: String, max_output_tokens: Option<u32>) -> open_ai::Request {
-        open_ai::Request {
-            model,
-            messages: self
-                .messages
-                .into_iter()
-                .map(|msg| match msg.role {
-                    Role::User => open_ai::RequestMessage::User {
-                        content: msg.string_contents(),
-                    },
-                    Role::Assistant => open_ai::RequestMessage::Assistant {
-                        content: Some(msg.string_contents()),
-                        tool_calls: Vec::new(),
-                    },
-                    Role::System => open_ai::RequestMessage::System {
-                        content: msg.string_contents(),
-                    },
-                })
-                .collect(),
-            stream: true,
-            stop: self.stop,
-            temperature: self.temperature,
-            max_tokens: max_output_tokens,
-            tools: Vec::new(),
-            tool_choice: None,
-        }
-    }
-
-    pub fn into_google(self, model: String) -> google_ai::GenerateContentRequest {
-        google_ai::GenerateContentRequest {
-            model,
-            contents: self
-                .messages
-                .into_iter()
-                .map(|msg| google_ai::Content {
-                    parts: vec![google_ai::Part::TextPart(google_ai::TextPart {
-                        text: msg.string_contents(),
-                    })],
-                    role: match msg.role {
-                        Role::User => google_ai::Role::User,
-                        Role::Assistant => google_ai::Role::Model,
-                        Role::System => google_ai::Role::User, // Google AI doesn't have a system role
-                    },
-                })
-                .collect(),
-            generation_config: Some(google_ai::GenerationConfig {
-                candidate_count: Some(1),
-                stop_sequences: Some(self.stop),
-                max_output_tokens: None,
-                temperature: Some(self.temperature as f64),
-                top_p: None,
-                top_k: None,
-            }),
-            safety_settings: None,
-        }
-    }
-
-    pub fn into_anthropic(self, model: String, max_output_tokens: u32) -> anthropic::Request {
-        let mut new_messages: Vec<anthropic::Message> = Vec::new();
-        let mut system_message = String::new();
-
-        for message in self.messages {
-            if message.contents_empty() {
-                continue;
-            }
-
-            match message.role {
-                Role::User | Role::Assistant => {
-                    let cache_control = if message.cache {
-                        Some(anthropic::CacheControl {
-                            cache_type: anthropic::CacheControlType::Ephemeral,
-                        })
-                    } else {
-                        None
-                    };
-                    let anthropic_message_content: Vec<anthropic::RequestContent> = message
-                        .content
-                        .into_iter()
-                        .filter_map(|content| match content {
-                            MessageContent::Text(text) => {
-                                if !text.is_empty() {
-                                    Some(anthropic::RequestContent::Text {
-                                        text,
-                                        cache_control,
-                                    })
-                                } else {
-                                    None
-                                }
-                            }
-                            MessageContent::Image(image) => {
-                                Some(anthropic::RequestContent::Image {
-                                    source: anthropic::ImageSource {
-                                        source_type: "base64".to_string(),
-                                        media_type: "image/png".to_string(),
-                                        data: image.source.to_string(),
-                                    },
-                                    cache_control,
-                                })
-                            }
-                            MessageContent::ToolUse(tool_use) => {
-                                Some(anthropic::RequestContent::ToolUse {
-                                    id: tool_use.id,
-                                    name: tool_use.name,
-                                    input: tool_use.input,
-                                    cache_control,
-                                })
-                            }
-                            MessageContent::ToolResult(tool_result) => {
-                                Some(anthropic::RequestContent::ToolResult {
-                                    tool_use_id: tool_result.tool_use_id,
-                                    is_error: tool_result.is_error,
-                                    content: tool_result.content,
-                                    cache_control,
-                                })
-                            }
-                        })
-                        .collect();
-                    let anthropic_role = match message.role {
-                        Role::User => anthropic::Role::User,
-                        Role::Assistant => anthropic::Role::Assistant,
-                        Role::System => unreachable!("System role should never occur here"),
-                    };
-                    if let Some(last_message) = new_messages.last_mut() {
-                        if last_message.role == anthropic_role {
-                            last_message.content.extend(anthropic_message_content);
-                            continue;
-                        }
-                    }
-                    new_messages.push(anthropic::Message {
-                        role: anthropic_role,
-                        content: anthropic_message_content,
-                    });
-                }
-                Role::System => {
-                    if !system_message.is_empty() {
-                        system_message.push_str("\n\n");
-                    }
-                    system_message.push_str(&message.string_contents());
-                }
-            }
-        }
-
-        anthropic::Request {
-            model,
-            messages: new_messages,
-            max_tokens: max_output_tokens,
-            system: Some(system_message),
-            tools: self
-                .tools
-                .into_iter()
-                .map(|tool| anthropic::Tool {
-                    name: tool.name,
-                    description: tool.description,
-                    input_schema: tool.input_schema,
-                })
-                .collect(),
-            tool_choice: None,
-            metadata: None,
-            stop_sequences: Vec::new(),
-            temperature: None,
-            top_k: None,
-            top_p: None,
-        }
-    }
+    pub temperature: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Eq, PartialEq)]

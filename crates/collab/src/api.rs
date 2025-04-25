@@ -6,12 +6,13 @@ pub mod ips_file;
 pub mod slack;
 
 use crate::{
-    auth,
+    AppState, Error, Result, auth,
     db::{User, UserId},
-    rpc, AppState, Error, Result,
+    rpc,
 };
 use anyhow::anyhow;
 use axum::{
+    Extension, Json, Router,
     body::Body,
     extract::{Path, Query},
     headers::Header,
@@ -19,7 +20,6 @@ use axum::{
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
-    Extension, Json, Router,
 };
 use axum_extra::response::ErasedJson;
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,39 @@ impl Header for CloudflareIpCountryHeader {
 }
 
 impl std::fmt::Display for CloudflareIpCountryHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+pub struct SystemIdHeader(String);
+
+impl Header for SystemIdHeader {
+    fn name() -> &'static HeaderName {
+        static SYSTEM_ID_HEADER: OnceLock<HeaderName> = OnceLock::new();
+        SYSTEM_ID_HEADER.get_or_init(|| HeaderName::from_static("x-zed-system-id"))
+    }
+
+    fn decode<'i, I>(values: &mut I) -> Result<Self, axum::headers::Error>
+    where
+        Self: Sized,
+        I: Iterator<Item = &'i axum::http::HeaderValue>,
+    {
+        let system_id = values
+            .next()
+            .ok_or_else(axum::headers::Error::invalid)?
+            .to_str()
+            .map_err(|_| axum::headers::Error::invalid())?;
+
+        Ok(Self(system_id.to_string()))
+    }
+
+    fn encode<E: Extend<axum::http::HeaderValue>>(&self, _values: &mut E) {
+        unimplemented!()
+    }
+}
+
+impl std::fmt::Display for SystemIdHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -111,6 +144,7 @@ struct AuthenticatedUserParams {
     github_user_id: i32,
     github_login: String,
     github_email: Option<String>,
+    github_name: Option<String>,
     github_user_created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -132,6 +166,7 @@ async fn get_authenticated_user(
             &params.github_login,
             params.github_user_id,
             params.github_email.as_deref(),
+            params.github_name.as_deref(),
             params.github_user_created_at,
             initial_channel_id,
         )

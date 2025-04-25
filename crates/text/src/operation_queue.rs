@@ -34,7 +34,7 @@ impl<T: Operation> Default for OperationQueue<T> {
 
 impl<T: Operation> OperationQueue<T> {
     pub fn new() -> Self {
-        OperationQueue(SumTree::new())
+        OperationQueue(SumTree::default())
     }
 
     pub fn len(&self) -> usize {
@@ -58,7 +58,7 @@ impl<T: Operation> OperationQueue<T> {
 
     pub fn drain(&mut self) -> Self {
         let clone = self.clone();
-        self.0 = SumTree::new();
+        self.0 = SumTree::default();
         clone
     }
 
@@ -70,6 +70,10 @@ impl<T: Operation> OperationQueue<T> {
 impl Summary for OperationSummary {
     type Context = ();
 
+    fn zero(_cx: &()) -> Self {
+        Default::default()
+    }
+
     fn add_summary(&mut self, other: &Self, _: &()) {
         assert!(self.key < other.key);
         self.key = other.key;
@@ -77,7 +81,7 @@ impl Summary for OperationSummary {
     }
 }
 
-impl<'a> Add<&'a Self> for OperationSummary {
+impl Add<&Self> for OperationSummary {
     type Output = Self;
 
     fn add(self, other: &Self) -> Self {
@@ -89,7 +93,11 @@ impl<'a> Add<&'a Self> for OperationSummary {
     }
 }
 
-impl<'a> Dimension<'a, OperationSummary> for OperationKey {
+impl Dimension<'_, OperationSummary> for OperationKey {
+    fn zero(_cx: &()) -> Self {
+        Default::default()
+    }
+
     fn add_summary(&mut self, summary: &OperationSummary, _: &()) {
         assert!(*self <= summary.key);
         *self = summary.key;
@@ -99,7 +107,7 @@ impl<'a> Dimension<'a, OperationSummary> for OperationKey {
 impl<T: Operation> Item for OperationItem<T> {
     type Summary = OperationSummary;
 
-    fn summary(&self) -> Self::Summary {
+    fn summary(&self, _cx: &()) -> Self::Summary {
         OperationSummary {
             key: OperationKey::new(self.0.lamport_timestamp()),
             len: 1,

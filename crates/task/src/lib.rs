@@ -1,11 +1,13 @@
 //! Baseline interface of Tasks in Zed: all tasks in Zed are intended to use those for implementing their own logic.
-#![deny(missing_docs)]
 
+mod debug_format;
+mod serde_helpers;
 pub mod static_source;
 mod task_template;
+mod vscode_debug_format;
 mod vscode_format;
 
-use collections::{hash_map, HashMap, HashSet};
+use collections::{HashMap, HashSet, hash_map};
 use gpui::SharedString;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -13,8 +15,17 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub use task_template::{HideStrategy, RevealStrategy, TaskTemplate, TaskTemplates};
+pub use debug_format::{
+    AttachRequest, DebugRequest, DebugTaskDefinition, DebugTaskFile, DebugTaskTemplate,
+    LaunchRequest, TcpArgumentsTemplate,
+};
+pub use task_template::{
+    DebugArgs, DebugArgsRequest, HideStrategy, RevealStrategy, TaskModal, TaskTemplate,
+    TaskTemplates, TaskType,
+};
+pub use vscode_debug_format::VsCodeDebugTaskFile;
 pub use vscode_format::VsCodeTaskFile;
+pub use zed_actions::RevealTarget;
 
 /// Task identifier, unique within the application.
 /// Based on it, task reruns and terminal tabs are managed.
@@ -47,13 +58,21 @@ pub struct SpawnInTerminal {
     pub allow_concurrent_runs: bool,
     /// What to do with the terminal pane and tab, after the command was started.
     pub reveal: RevealStrategy,
+    /// Where to show tasks' terminal output.
+    pub reveal_target: RevealTarget,
     /// What to do with the terminal pane and tab, after the command had finished.
     pub hide: HideStrategy,
     /// Which shell to use when spawning the task.
     pub shell: Shell,
+    /// Whether to show the task summary line in the task output (sucess/failure).
+    pub show_summary: bool,
+    /// Whether to show the command line in the task output.
+    pub show_command: bool,
+    /// Whether to show the rerun button in the terminal tab.
+    pub show_rerun: bool,
 }
 
-/// A final form of the [`TaskTemplate`], that got resolved with a particualar [`TaskContext`] and now is ready to spawn the actual task.
+/// A final form of the [`TaskTemplate`], that got resolved with a particular [`TaskContext`] and now is ready to spawn the actual task.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedTask {
     /// A way to distinguish tasks produced by the same template, but different contexts.
@@ -77,6 +96,63 @@ impl ResolvedTask {
     /// A task template before the resolution.
     pub fn original_task(&self) -> &TaskTemplate {
         &self.original_task
+    }
+
+    /// Get the task type that determines what this task is used for
+    /// And where is it shown in the UI
+    pub fn task_type(&self) -> TaskType {
+        self.original_task.task_type.clone()
+    }
+
+    /// Get the configuration for the debug adapter that should be used for this task.
+    pub fn resolved_debug_adapter_config(&self) -> Option<DebugTaskTemplate> {
+        match self.original_task.task_type.clone() {
+            TaskType::Debug(debug_args) if self.resolved.is_some() => {
+                let resolved = self
+                    .resolved
+                    .as_ref()
+                    .expect("We just checked if this was some");
+
+                let args = resolved
+                    .args
+                    .iter()
+                    .cloned()
+                    .map(|arg| {
+                        if arg.starts_with("$") {
+                            arg.strip_prefix("$")
+                                .and_then(|arg| resolved.env.get(arg).map(ToOwned::to_owned))
+                                .unwrap_or_else(|| arg)
+                        } else {
+                            arg
+                        }
+                    })
+                    .collect();
+
+                Some(DebugTaskTemplate {
+                    locator: debug_args.locator.clone(),
+                    definition: DebugTaskDefinition {
+                        label: resolved.label.clone(),
+                        adapter: debug_args.adapter.clone(),
+                        request: match debug_args.request {
+                            crate::task_template::DebugArgsRequest::Launch => {
+                                DebugRequest::Launch(LaunchRequest {
+                                    program: resolved.command.clone(),
+                                    cwd: resolved.cwd.clone(),
+                                    args,
+                                })
+                            }
+                            crate::task_template::DebugArgsRequest::Attach(attach_config) => {
+                                DebugRequest::Attach(attach_config)
+                            }
+                        },
+                        initialize_args: debug_args.initialize_args,
+                        tcp_connection: debug_args.tcp_connection,
+                        stop_on_entry: debug_args.stop_on_entry,
+                    },
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Variables that were substituted during the task template resolution.
@@ -131,6 +207,10 @@ impl VariableName {
     pub fn template_value(&self) -> String {
         format!("${self}")
     }
+    /// Generates a `"$VARIABLE"`-like string, to be used instead of `Self::template_value` when expanded value could contain spaces or special characters.
+    pub fn template_value_with_whitespace(&self) -> String {
+        format!("\"${self}\"")
+    }
 }
 
 impl FromStr for VariableName {
@@ -140,8 +220,13 @@ impl FromStr for VariableName {
         let without_prefix = s.strip_prefix(ZED_VARIABLE_NAME_PREFIX).ok_or(())?;
         let value = match without_prefix {
             "FILE" => Self::File,
+            "FILENAME" => Self::Filename,
+            "RELATIVE_FILE" => Self::RelativeFile,
+            "DIRNAME" => Self::Dirname,
+            "STEM" => Self::Stem,
             "WORKTREE_ROOT" => Self::WorktreeRoot,
             "SYMBOL" => Self::Symbol,
+            "RUNNABLE_SYMBOL" => Self::RunnableSymbol,
             "SELECTED_TEXT" => Self::SelectedText,
             "ROW" => Self::Row,
             "COLUMN" => Self::Column,
@@ -264,5 +349,225 @@ pub enum Shell {
         program: String,
         /// The arguments to pass to the program.
         args: Vec<String>,
+        /// An optional string to override the title of the terminal tab
+        title_override: Option<SharedString>,
     },
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsShellType {
+    Powershell,
+    Cmd,
+    Other,
+}
+
+/// ShellBuilder is used to turn a user-requested task into a
+/// program that can be executed by the shell.
+pub struct ShellBuilder {
+    program: String,
+    args: Vec<String>,
+}
+
+pub static DEFAULT_REMOTE_SHELL: &str = "\"${SHELL:-sh}\"";
+
+impl ShellBuilder {
+    /// Create a new ShellBuilder as configured.
+    pub fn new(is_local: bool, shell: &Shell) -> Self {
+        let (program, args) = match shell {
+            Shell::System => {
+                if is_local {
+                    (Self::system_shell(), Vec::new())
+                } else {
+                    (DEFAULT_REMOTE_SHELL.to_string(), Vec::new())
+                }
+            }
+            Shell::Program(shell) => (shell.clone(), Vec::new()),
+            Shell::WithArguments { program, args, .. } => (program.clone(), args.clone()),
+        };
+        Self { program, args }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+impl ShellBuilder {
+    /// Returns the label to show in the terminal tab
+    pub fn command_label(&self, command_label: &str) -> String {
+        format!("{} -i -c '{}'", self.program, command_label)
+    }
+
+    /// Returns the program and arguments to run this task in a shell.
+    pub fn build(mut self, task_command: String, task_args: &Vec<String>) -> (String, Vec<String>) {
+        let combined_command = task_args
+            .into_iter()
+            .fold(task_command, |mut command, arg| {
+                command.push(' ');
+                command.push_str(&arg);
+                command
+            });
+        self.args
+            .extend(["-i".to_owned(), "-c".to_owned(), combined_command]);
+
+        (self.program, self.args)
+    }
+
+    fn system_shell() -> String {
+        std::env::var("SHELL").unwrap_or("/bin/sh".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl ShellBuilder {
+    /// Returns the label to show in the terminal tab
+    pub fn command_label(&self, command_label: &str) -> String {
+        match self.windows_shell_type() {
+            WindowsShellType::Powershell => {
+                format!("{} -C '{}'", self.program, command_label)
+            }
+            WindowsShellType::Cmd => {
+                format!("{} /C '{}'", self.program, command_label)
+            }
+            WindowsShellType::Other => {
+                format!("{} -i -c '{}'", self.program, command_label)
+            }
+        }
+    }
+
+    /// Returns the program and arguments to run this task in a shell.
+    pub fn build(mut self, task_command: String, task_args: &Vec<String>) -> (String, Vec<String>) {
+        let combined_command = task_args
+            .into_iter()
+            .fold(task_command, |mut command, arg| {
+                command.push(' ');
+                command.push_str(&self.to_windows_shell_variable(arg.to_string()));
+                command
+            });
+
+        match self.windows_shell_type() {
+            WindowsShellType::Powershell => self.args.extend(["-C".to_owned(), combined_command]),
+            WindowsShellType::Cmd => self.args.extend(["/C".to_owned(), combined_command]),
+            WindowsShellType::Other => {
+                self.args
+                    .extend(["-i".to_owned(), "-c".to_owned(), combined_command])
+            }
+        }
+
+        (self.program, self.args)
+    }
+    fn windows_shell_type(&self) -> WindowsShellType {
+        if self.program == "powershell"
+            || self.program.ends_with("powershell.exe")
+            || self.program == "pwsh"
+            || self.program.ends_with("pwsh.exe")
+        {
+            WindowsShellType::Powershell
+        } else if self.program == "cmd" || self.program.ends_with("cmd.exe") {
+            WindowsShellType::Cmd
+        } else {
+            // Someother shell detected, the user might install and use a
+            // unix-like shell.
+            WindowsShellType::Other
+        }
+    }
+
+    // `alacritty_terminal` uses this as default on Windows. See:
+    // https://github.com/alacritty/alacritty/blob/0d4ab7bca43213d96ddfe40048fc0f922543c6f8/alacritty_terminal/src/tty/windows/mod.rs#L130
+    // We could use `util::get_windows_system_shell()` here, but we are running tasks here, so leave it to `powershell.exe`
+    // should be okay.
+    fn system_shell() -> String {
+        "powershell.exe".to_string()
+    }
+
+    fn to_windows_shell_variable(&self, input: String) -> String {
+        match self.windows_shell_type() {
+            WindowsShellType::Powershell => Self::to_powershell_variable(input),
+            WindowsShellType::Cmd => Self::to_cmd_variable(input),
+            WindowsShellType::Other => input,
+        }
+    }
+
+    fn to_cmd_variable(input: String) -> String {
+        if let Some(var_str) = input.strip_prefix("${") {
+            if var_str.find(':').is_none() {
+                // If the input starts with "${", remove the trailing "}"
+                format!("%{}%", &var_str[..var_str.len() - 1])
+            } else {
+                // `${SOME_VAR:-SOME_DEFAULT}`, we currently do not handle this situation,
+                // which will result in the task failing to run in such cases.
+                input
+            }
+        } else if let Some(var_str) = input.strip_prefix('$') {
+            // If the input starts with "$", directly append to "$env:"
+            format!("%{}%", var_str)
+        } else {
+            // If no prefix is found, return the input as is
+            input
+        }
+    }
+
+    fn to_powershell_variable(input: String) -> String {
+        if let Some(var_str) = input.strip_prefix("${") {
+            if var_str.find(':').is_none() {
+                // If the input starts with "${", remove the trailing "}"
+                format!("$env:{}", &var_str[..var_str.len() - 1])
+            } else {
+                // `${SOME_VAR:-SOME_DEFAULT}`, we currently do not handle this situation,
+                // which will result in the task failing to run in such cases.
+                input
+            }
+        } else if let Some(var_str) = input.strip_prefix('$') {
+            // If the input starts with "$", directly append to "$env:"
+            format!("$env:{}", var_str)
+        } else {
+            // If no prefix is found, return the input as is
+            input
+        }
+    }
+}
+
+type VsCodeEnvVariable = String;
+type ZedEnvVariable = String;
+
+struct EnvVariableReplacer {
+    variables: HashMap<VsCodeEnvVariable, ZedEnvVariable>,
+}
+
+impl EnvVariableReplacer {
+    fn new(variables: HashMap<VsCodeEnvVariable, ZedEnvVariable>) -> Self {
+        Self { variables }
+    }
+    // Replaces occurrences of VsCode-specific environment variables with Zed equivalents.
+    fn replace(&self, input: &str) -> String {
+        shellexpand::env_with_context_no_errors(&input, |var: &str| {
+            // Colons denote a default value in case the variable is not set. We want to preserve that default, as otherwise shellexpand will substitute it for us.
+            let colon_position = var.find(':').unwrap_or(var.len());
+            let (left, right) = var.split_at(colon_position);
+            if left == "env" && !right.is_empty() {
+                let variable_name = &right[1..];
+                return Some(format!("${{{variable_name}}}"));
+            }
+            let (variable_name, default) = (left, right);
+            let append_previous_default = |ret: &mut String| {
+                if !default.is_empty() {
+                    ret.push_str(default);
+                }
+            };
+            if let Some(substitution) = self.variables.get(variable_name) {
+                // Got a VSCode->Zed hit, perform a substitution
+                let mut name = format!("${{{substitution}");
+                append_previous_default(&mut name);
+                name.push('}');
+                return Some(name);
+            }
+            // This is an unknown variable.
+            // We should not error out, as they may come from user environment (e.g. $PATH). That means that the variable substitution might not be perfect.
+            // If there's a default, we need to return the string verbatim as otherwise shellexpand will apply that default for us.
+            if !default.is_empty() {
+                return Some(format!("${{{var}}}"));
+            }
+            // Else we can just return None and that variable will be left as is.
+            None
+        })
+        .into_owned()
+    }
 }

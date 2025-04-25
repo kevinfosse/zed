@@ -13,6 +13,7 @@ async fn test_channel_buffers(db: &Arc<Database>) {
     let a_id = db
         .create_user(
             "user_a@example.com",
+            None,
             false,
             NewUserParams {
                 github_login: "user_a".into(),
@@ -25,6 +26,7 @@ async fn test_channel_buffers(db: &Arc<Database>) {
     let b_id = db
         .create_user(
             "user_b@example.com",
+            None,
             false,
             NewUserParams {
                 github_login: "user_b".into(),
@@ -39,6 +41,7 @@ async fn test_channel_buffers(db: &Arc<Database>) {
     let c_id = db
         .create_user(
             "user_c@example.com",
+            None,
             false,
             NewUserParams {
                 github_login: "user_c".into(),
@@ -96,24 +99,23 @@ async fn test_channel_buffers(db: &Arc<Database>) {
         text::BufferId::new(1).unwrap(),
         buffer_response_b.base_text,
     );
-    buffer_b
-        .apply_ops(buffer_response_b.operations.into_iter().map(|operation| {
-            let operation = proto::deserialize_operation(operation).unwrap();
-            if let language::Operation::Buffer(operation) = operation {
-                operation
-            } else {
-                unreachable!()
-            }
-        }))
-        .unwrap();
+    buffer_b.apply_ops(buffer_response_b.operations.into_iter().map(|operation| {
+        let operation = proto::deserialize_operation(operation).unwrap();
+        if let language::Operation::Buffer(operation) = operation {
+            operation
+        } else {
+            unreachable!()
+        }
+    }));
 
     assert_eq!(buffer_b.text(), "hello, cruel world");
 
     // Ensure that C fails to open the buffer
-    assert!(db
-        .join_channel_buffer(zed_id, c_id, ConnectionId { owner_id, id: 3 })
-        .await
-        .is_err());
+    assert!(
+        db.join_channel_buffer(zed_id, c_id, ConnectionId { owner_id, id: 3 })
+            .await
+            .is_err()
+    );
 
     // Ensure that both collaborators have shown up
     assert_eq!(
@@ -123,11 +125,13 @@ async fn test_channel_buffers(db: &Arc<Database>) {
                 user_id: a_id.to_proto(),
                 peer_id: Some(rpc::proto::PeerId { id: 1, owner_id }),
                 replica_id: 0,
+                is_host: false,
             },
             rpc::proto::Collaborator {
                 user_id: b_id.to_proto(),
                 peer_id: Some(rpc::proto::PeerId { id: 2, owner_id }),
                 replica_id: 1,
+                is_host: false,
             }
         ]
     );
@@ -176,6 +180,7 @@ async fn test_channel_buffers_last_operations(db: &Database) {
     let user_id = db
         .create_user(
             "user_a@example.com",
+            None,
             false,
             NewUserParams {
                 github_login: "user_a".into(),
@@ -188,6 +193,7 @@ async fn test_channel_buffers_last_operations(db: &Database) {
     let observer_id = db
         .create_user(
             "user_b@example.com",
+            None,
             false,
             NewUserParams {
                 github_login: "user_b".into(),

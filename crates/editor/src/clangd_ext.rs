@@ -1,24 +1,26 @@
-use std::path::PathBuf;
-
 use anyhow::Context as _;
-use gpui::{View, ViewContext, WindowContext};
+use gpui::{App, Context, Entity, Window};
 use language::Language;
+use project::lsp_store::lsp_ext_command::SwitchSourceHeaderResult;
+use rpc::proto;
 use url::Url;
+use workspace::{OpenOptions, OpenVisible};
 
 use crate::lsp_ext::find_specific_language_server_in_selection;
 
-use crate::{element::register_action, Editor, SwitchSourceHeader};
+use crate::{Editor, SwitchSourceHeader, element::register_action};
 
-static CLANGD_SERVER_NAME: &str = "clangd";
+use project::lsp_store::clangd_ext::CLANGD_SERVER_NAME;
 
 fn is_c_language(language: &Language) -> bool {
-    return language.name().as_ref() == "C++" || language.name().as_ref() == "C";
+    return language.name() == "C++".into() || language.name() == "C".into();
 }
 
 pub fn switch_source_header(
     editor: &mut Editor,
     _: &SwitchSourceHeader,
-    cx: &mut ViewContext<'_, Editor>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
 ) {
     let Some(project) = &editor.project else {
         return;
@@ -27,36 +29,44 @@ pub fn switch_source_header(
         return;
     };
 
-    let Some((_, _, server_to_query, buffer)) =
-        find_specific_language_server_in_selection(editor, cx, is_c_language, CLANGD_SERVER_NAME)
-    else {
-        return;
-    };
-
+    let server_lookup =
+        find_specific_language_server_in_selection(editor, cx, is_c_language, CLANGD_SERVER_NAME);
     let project = project.clone();
-    let buffer_snapshot = buffer.read(cx).snapshot();
-    let source_file = buffer_snapshot
-        .file()
-        .unwrap()
-        .file_name(cx)
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let upstream_client = project.read(cx).lsp_store().read(cx).upstream_client();
+    cx.spawn_in(window, async move |_editor, cx| {
+        let Some((_, _, server_to_query, buffer)) =
+            server_lookup.await
+        else {
+            return Ok(());
+        };
+        let source_file = buffer.update(cx, |buffer, _| {
+            buffer.file().map(|file| file.path()).map(|path| path.to_string_lossy().to_string()).unwrap_or_else(|| "Unknown".to_string())
+        })?;
 
-    let switch_source_header_task = project.update(cx, |project, cx| {
-        project.request_lsp(
-            buffer,
-            project::LanguageServerToQuery::Other(server_to_query),
-            project::lsp_ext_command::SwitchSourceHeader,
-            cx,
-        )
-    });
-    cx.spawn(|_editor, mut cx| async move {
-        let switch_source_header = switch_source_header_task
-            .await
-            .with_context(|| format!("Switch source/header LSP request for path \"{}\" failed", source_file))?;
+        let switch_source_header = if let Some((client, project_id)) = upstream_client {
+            let buffer_id = buffer.update(cx, |buffer, _| buffer.remote_id())?;
+            let request = proto::LspExtSwitchSourceHeader {
+                project_id,
+                buffer_id: buffer_id.to_proto(),
+            };
+            let response = client
+                .request(request)
+                .await
+                .context("lsp ext switch source header proto request")?;
+            SwitchSourceHeaderResult(response.target_file)
+        } else {
+            project.update(cx, |project, cx| {
+                project.request_lsp(
+                    buffer,
+                    project::LanguageServerToQuery::Other(server_to_query),
+                    project::lsp_store::lsp_ext_command::SwitchSourceHeader,
+                    cx,
+                )
+            })?.await.with_context(|| format!("Switch source/header LSP request for path \"{source_file}\" failed"))?
+        };
+
         if switch_source_header.0.is_empty() {
-            log::info!("Clangd returned an empty string when requesting to switch source/header from \"{}\"", source_file);
+            log::info!("Clangd returned an empty string when requesting to switch source/header from \"{source_file}\"" );
             return Ok(());
         }
 
@@ -67,14 +77,17 @@ pub fn switch_source_header(
             )
         })?;
 
+        let path = goto.to_file_path().map_err(|()| {
+            anyhow::anyhow!("URL conversion to file path failed for \"{goto}\"")
+        })?;
+
         workspace
-            .update(&mut cx, |workspace, view_cx| {
-                workspace.open_abs_path(PathBuf::from(goto.path()), false, view_cx)
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_abs_path(path, OpenOptions { visible: Some(OpenVisible::None), ..Default::default() }, window, cx)
             })
             .with_context(|| {
                 format!(
-                    "Switch source/header could not open \"{}\" in workspace",
-                    goto.path()
+                    "Switch source/header could not open \"{goto}\" in workspace"
                 )
             })?
             .await
@@ -83,11 +96,16 @@ pub fn switch_source_header(
     .detach_and_log_err(cx);
 }
 
-pub fn apply_related_actions(editor: &View<Editor>, cx: &mut WindowContext) {
-    if editor.update(cx, |e, cx| {
-        find_specific_language_server_in_selection(e, cx, is_c_language, CLANGD_SERVER_NAME)
-            .is_some()
-    }) {
-        register_action(editor, cx, switch_source_header);
+pub fn apply_related_actions(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) {
+    if editor
+        .read(cx)
+        .buffer()
+        .read(cx)
+        .all_buffers()
+        .into_iter()
+        .filter_map(|buffer| buffer.read(cx).language())
+        .any(|language| is_c_language(language))
+    {
+        register_action(&editor, window, switch_source_header);
     }
 }

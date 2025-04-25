@@ -20,8 +20,8 @@ use parking_lot::Mutex;
 use sea_orm::ConnectionTrait;
 use sqlx::migrate::MigrateDatabase;
 use std::sync::{
-    atomic::{AtomicI32, AtomicU32, Ordering::SeqCst},
     Arc,
+    atomic::{AtomicI32, AtomicU32, Ordering::SeqCst},
 };
 
 pub struct TestDb {
@@ -74,7 +74,7 @@ impl TestDb {
         let mut rng = StdRng::from_entropy();
         let url = format!(
             "postgres://postgres@localhost/zed-test-{}",
-            rng.gen::<u128>()
+            rng.r#gen::<u128>()
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
@@ -177,6 +177,7 @@ static GITHUB_USER_ID: AtomicI32 = AtomicI32::new(5);
 async fn new_test_user(db: &Arc<Database>, email: &str) -> UserId {
     db.create_user(
         email,
+        None,
         false,
         NewUserParams {
             github_login: email[0..email.find('@').unwrap()].to_string(),

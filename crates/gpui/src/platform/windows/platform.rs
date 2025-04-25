@@ -6,60 +6,52 @@ use std::{
     sync::Arc,
 };
 
-use ::util::ResultExt;
-use anyhow::{anyhow, Context, Result};
+use ::util::{ResultExt, paths::SanitizedPath};
+use anyhow::{Context as _, Result, anyhow};
+use async_task::Runnable;
 use futures::channel::oneshot::{self, Receiver};
 use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
 use windows::{
-    core::*,
+    UI::ViewManagement::UISettings,
     Win32::{
         Foundation::*,
-        Globalization::u_memcpy,
         Graphics::{
             Gdi::*,
             Imaging::{CLSID_WICImagingFactory, IWICImagingFactory},
         },
         Security::Credentials::*,
-        System::{
-            Com::*,
-            DataExchange::{
-                CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard,
-                RegisterClipboardFormatW, SetClipboardData,
-            },
-            LibraryLoader::*,
-            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
-            Ole::*,
-            SystemInformation::*,
-            Threading::*,
-        },
+        System::{Com::*, LibraryLoader::*, Ole::*, SystemInformation::*, Threading::*},
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
-    UI::ViewManagement::UISettings,
+    core::*,
 };
 
-use crate::*;
+use crate::{platform::blade::BladeContext, *};
 
 pub(crate) struct WindowsPlatform {
     state: RefCell<WindowsPlatformState>,
     raw_window_handles: RwLock<SmallVec<[HWND; 4]>>,
+    gpu_context: BladeContext,
     // The below members will never change throughout the entire lifecycle of the app.
     icon: HICON,
+    main_receiver: flume::Receiver<Runnable>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<DirectWriteTextSystem>,
-    clipboard_hash_format: u32,
-    clipboard_metadata_format: u32,
     windows_version: WindowsVersion,
     bitmap_factory: ManuallyDrop<IWICImagingFactory>,
     validation_number: usize,
+    main_thread_id_win32: u32,
 }
 
 pub(crate) struct WindowsPlatformState {
     callbacks: PlatformCallbacks,
+    menus: Vec<OwnedMenu>,
+    jump_list: JumpList,
     // NOTE: standard cursor handles don't need to close.
-    pub(crate) current_cursor: HCURSOR,
+    pub(crate) current_cursor: Option<HCURSOR>,
 }
 
 #[derive(Default)]
@@ -75,11 +67,14 @@ struct PlatformCallbacks {
 impl WindowsPlatformState {
     fn new() -> Self {
         let callbacks = PlatformCallbacks::default();
+        let jump_list = JumpList::new();
         let current_cursor = load_cursor(CursorStyle::Arrow);
 
         Self {
             callbacks,
+            jump_list,
             current_cursor,
+            menus: Vec::new(),
         }
     }
 }
@@ -89,7 +84,14 @@ impl WindowsPlatform {
         unsafe {
             OleInitialize(None).expect("unable to initialize Windows OLE");
         }
-        let dispatcher = Arc::new(WindowsDispatcher::new());
+        let (main_sender, main_receiver) = flume::unbounded::<Runnable>();
+        let main_thread_id_win32 = unsafe { GetCurrentThreadId() };
+        let validation_number = rand::random::<usize>();
+        let dispatcher = Arc::new(WindowsDispatcher::new(
+            main_sender,
+            main_thread_id_win32,
+            validation_number,
+        ));
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
         let foreground_executor = ForegroundExecutor::new(dispatcher);
         let bitmap_factory = ManuallyDrop::new(unsafe {
@@ -103,38 +105,31 @@ impl WindowsPlatform {
         let icon = load_icon().unwrap_or_default();
         let state = RefCell::new(WindowsPlatformState::new());
         let raw_window_handles = RwLock::new(SmallVec::new());
-        let clipboard_hash_format = register_clipboard_format(CLIPBOARD_HASH_FORMAT).unwrap();
-        let clipboard_metadata_format =
-            register_clipboard_format(CLIPBOARD_METADATA_FORMAT).unwrap();
+        let gpu_context = BladeContext::new().expect("Unable to init GPU context");
         let windows_version = WindowsVersion::new().expect("Error retrieve windows version");
-        let validation_number = rand::random::<usize>();
 
         Self {
             state,
             raw_window_handles,
+            gpu_context,
             icon,
+            main_receiver,
             background_executor,
             foreground_executor,
             text_system,
-            clipboard_hash_format,
-            clipboard_metadata_format,
             windows_version,
             bitmap_factory,
             validation_number,
+            main_thread_id_win32,
         }
     }
 
     fn redraw_all(&self) {
         for handle in self.raw_window_handles.read().iter() {
             unsafe {
-                RedrawWindow(
-                    *handle,
-                    None,
-                    HRGN::default(),
-                    RDW_INVALIDATE | RDW_UPDATENOW,
-                )
-                .ok()
-                .log_err();
+                RedrawWindow(Some(*handle), None, None, RDW_INVALIDATE | RDW_UPDATENOW)
+                    .ok()
+                    .log_err();
             }
         }
     }
@@ -153,20 +148,11 @@ impl WindowsPlatform {
             .read()
             .iter()
             .for_each(|handle| unsafe {
-                PostMessageW(*handle, message, wparam, lparam).log_err();
+                PostMessageW(Some(*handle), message, wparam, lparam).log_err();
             });
     }
 
-    fn close_one_window(
-        &self,
-        target_window: HWND,
-        validation_number: usize,
-        msg: *const MSG,
-    ) -> bool {
-        if validation_number != self.validation_number {
-            unsafe { DispatchMessageW(msg) };
-            return false;
-        }
+    fn close_one_window(&self, target_window: HWND) -> bool {
         let mut lock = self.raw_window_handles.write();
         let index = lock
             .iter()
@@ -175,6 +161,126 @@ impl WindowsPlatform {
         lock.remove(index);
 
         lock.is_empty()
+    }
+
+    #[inline]
+    fn run_foreground_task(&self) {
+        for runnable in self.main_receiver.drain() {
+            runnable.run();
+        }
+    }
+
+    fn generate_creation_info(&self) -> WindowCreationInfo {
+        WindowCreationInfo {
+            icon: self.icon,
+            executor: self.foreground_executor.clone(),
+            current_cursor: self.state.borrow().current_cursor,
+            windows_version: self.windows_version,
+            validation_number: self.validation_number,
+            main_receiver: self.main_receiver.clone(),
+            main_thread_id_win32: self.main_thread_id_win32,
+        }
+    }
+
+    fn handle_dock_action_event(&self, action_idx: usize) {
+        let mut lock = self.state.borrow_mut();
+        if let Some(mut callback) = lock.callbacks.app_menu_action.take() {
+            let Some(action) = lock
+                .jump_list
+                .dock_menus
+                .get(action_idx)
+                .map(|dock_menu| dock_menu.action.boxed_clone())
+            else {
+                lock.callbacks.app_menu_action = Some(callback);
+                log::error!("Dock menu for index {action_idx} not found");
+                return;
+            };
+            drop(lock);
+            callback(&*action);
+            self.state.borrow_mut().callbacks.app_menu_action = Some(callback);
+        }
+    }
+
+    // Returns true if the app should quit.
+    fn handle_events(&self) -> bool {
+        let mut msg = MSG::default();
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                match msg.message {
+                    WM_QUIT => return true,
+                    WM_GPUI_CLOSE_ONE_WINDOW
+                    | WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD
+                    | WM_GPUI_DOCK_MENU_ACTION => {
+                        if self.handle_gpui_evnets(msg.message, msg.wParam, msg.lParam, &msg) {
+                            return true;
+                        }
+                    }
+                    _ => {
+                        // todo(windows)
+                        // crate `windows 0.56` reports true as Err
+                        TranslateMessage(&msg).as_bool();
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    // Returns true if the app should quit.
+    fn handle_gpui_evnets(
+        &self,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        msg: *const MSG,
+    ) -> bool {
+        if wparam.0 != self.validation_number {
+            unsafe { DispatchMessageW(msg) };
+            return false;
+        }
+        match message {
+            WM_GPUI_CLOSE_ONE_WINDOW => {
+                if self.close_one_window(HWND(lparam.0 as _)) {
+                    return true;
+                }
+            }
+            WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD => self.run_foreground_task(),
+            WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
+            _ => unreachable!(),
+        }
+        false
+    }
+
+    fn set_dock_menus(&self, menus: Vec<MenuItem>) {
+        let mut actions = Vec::new();
+        menus.into_iter().for_each(|menu| {
+            if let Some(dock_menu) = DockMenuItem::new(menu).log_err() {
+                actions.push(dock_menu);
+            }
+        });
+        let mut lock = self.state.borrow_mut();
+        lock.jump_list.dock_menus = actions;
+        update_jump_list(&lock.jump_list).log_err();
+    }
+
+    fn update_jump_list(
+        &self,
+        menus: Vec<MenuItem>,
+        entries: Vec<SmallVec<[PathBuf; 2]>>,
+    ) -> Vec<SmallVec<[PathBuf; 2]>> {
+        let mut actions = Vec::new();
+        menus.into_iter().for_each(|menu| {
+            if let Some(dock_menu) = DockMenuItem::new(menu).log_err() {
+                actions.push(dock_menu);
+            }
+        });
+        let mut lock = self.state.borrow_mut();
+        lock.jump_list.dock_menus = actions;
+        lock.jump_list.recent_workspaces = entries;
+        update_jump_list(&lock.jump_list)
+            .log_err()
+            .unwrap_or_default()
     }
 }
 
@@ -191,6 +297,18 @@ impl Platform for WindowsPlatform {
         self.text_system.clone()
     }
 
+    fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
+        Box::new(
+            KeyboardLayout::new()
+                .log_err()
+                .unwrap_or(KeyboardLayout::unknown()),
+        )
+    }
+
+    fn on_keyboard_layout_change(&self, _callback: Box<dyn FnMut()>) {
+        // todo(windows)
+    }
+
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
         on_finish_launching();
         let vsync_event = unsafe { Owned::new(CreateEventW(None, false, false, None).unwrap()) };
@@ -202,33 +320,11 @@ impl Platform for WindowsPlatform {
 
             match wait_result {
                 // compositor clock ticked so we should draw a frame
-                WAIT_EVENT(0) => {
-                    self.redraw_all();
-                }
+                WAIT_EVENT(0) => self.redraw_all(),
                 // Windows thread messages are posted
                 WAIT_EVENT(1) => {
-                    let mut msg = MSG::default();
-                    unsafe {
-                        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                            match msg.message {
-                                WM_QUIT => break 'a,
-                                CLOSE_ONE_WINDOW => {
-                                    if self.close_one_window(
-                                        HWND(msg.lParam.0 as _),
-                                        msg.wParam.0,
-                                        &msg,
-                                    ) {
-                                        break 'a;
-                                    }
-                                }
-                                _ => {
-                                    // todo(windows)
-                                    // crate `windows 0.56` reports true as Err
-                                    TranslateMessage(&msg).as_bool();
-                                    DispatchMessageW(&msg);
-                                }
-                            }
-                        }
+                    if self.handle_events() {
+                        break 'a;
                     }
                 }
                 _ => {
@@ -271,7 +367,7 @@ impl Platform for WindowsPlatform {
             pid,
             app_path.display(),
         );
-        let restart_process = std::process::Command::new("powershell.exe")
+        let restart_process = util::command::new_std_command("powershell.exe")
             .arg("-command")
             .arg(script)
             .spawn();
@@ -282,13 +378,9 @@ impl Platform for WindowsPlatform {
         }
     }
 
-    // todo(windows)
     fn activate(&self, _ignoring_other_apps: bool) {}
 
-    // todo(windows)
-    fn hide(&self) {
-        unimplemented!()
-    }
+    fn hide(&self) {}
 
     // todo(windows)
     fn hide_other_apps(&self) {
@@ -308,6 +400,18 @@ impl Platform for WindowsPlatform {
         WindowsDisplay::primary_monitor().map(|display| Rc::new(display) as Rc<dyn PlatformDisplay>)
     }
 
+    fn is_screen_capture_supported(&self) -> bool {
+        false
+    }
+
+    fn screen_capture_sources(
+        &self,
+    ) -> oneshot::Receiver<Result<Vec<Box<dyn ScreenCaptureSource>>>> {
+        let (mut tx, rx) = oneshot::channel();
+        tx.send(Err(anyhow!("screen capture not implemented"))).ok();
+        rx
+    }
+
     fn active_window(&self) -> Option<AnyWindowHandle> {
         let active_window_hwnd = unsafe { GetActiveWindow() };
         self.try_get_windows_inner_from_hwnd(active_window_hwnd)
@@ -319,17 +423,12 @@ impl Platform for WindowsPlatform {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> Result<Box<dyn PlatformWindow>> {
-        let lock = self.state.borrow();
         let window = WindowsWindow::new(
             handle,
             options,
-            self.icon,
-            self.foreground_executor.clone(),
-            lock.current_cursor,
-            self.windows_version,
-            self.validation_number,
+            self.generate_creation_info(),
+            &self.gpu_context,
         )?;
-        drop(lock);
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(handle);
 
@@ -382,6 +481,11 @@ impl Platform for WindowsPlatform {
         rx
     }
 
+    fn can_select_mixed_files_and_dirs(&self) -> bool {
+        // The FOS_PICKFOLDERS flag toggles between "only files" and "only folders".
+        false
+    }
+
     fn reveal_path(&self, path: &Path) {
         let Ok(file_full_path) = path.canonicalize() else {
             log::error!("unable to parse file path");
@@ -400,6 +504,24 @@ impl Platform for WindowsPlatform {
             .detach();
     }
 
+    fn open_with_system(&self, path: &Path) {
+        let Ok(full_path) = path.canonicalize() else {
+            log::error!("unable to parse file full path: {}", path.display());
+            return;
+        };
+        self.background_executor()
+            .spawn(async move {
+                let Some(full_path_str) = full_path.to_str() else {
+                    return;
+                };
+                if full_path_str.is_empty() {
+                    return;
+                };
+                open_target(full_path_str);
+            })
+            .detach();
+    }
+
     fn on_quit(&self, callback: Box<dyn FnMut()>) {
         self.state.borrow_mut().callbacks.quit = Some(callback);
     }
@@ -408,9 +530,17 @@ impl Platform for WindowsPlatform {
         self.state.borrow_mut().callbacks.reopen = Some(callback);
     }
 
-    // todo(windows)
-    fn set_menus(&self, _menus: Vec<Menu>, _keymap: &Keymap) {}
-    fn set_dock_menu(&self, _menus: Vec<MenuItem>, _keymap: &Keymap) {}
+    fn set_menus(&self, menus: Vec<Menu>, _keymap: &Keymap) {
+        self.state.borrow_mut().menus = menus.into_iter().map(|menu| menu.owned()).collect();
+    }
+
+    fn get_menus(&self) -> Option<Vec<OwnedMenu>> {
+        Some(self.state.borrow().menus.clone())
+    }
+
+    fn set_dock_menu(&self, menus: Vec<MenuItem>, _keymap: &Keymap) {
+        self.set_dock_menus(menus);
+    }
 
     fn on_app_menu_action(&self, callback: Box<dyn FnMut(&dyn Action)>) {
         self.state.borrow_mut().callbacks.app_menu_action = Some(callback);
@@ -436,8 +566,12 @@ impl Platform for WindowsPlatform {
     fn set_cursor_style(&self, style: CursorStyle) {
         let hcursor = load_cursor(style);
         let mut lock = self.state.borrow_mut();
-        if lock.current_cursor.0 != hcursor.0 {
-            self.post_message(CURSOR_STYLE_CHANGED, WPARAM(0), LPARAM(hcursor.0 as isize));
+        if lock.current_cursor.map(|c| c.0) != hcursor.map(|c| c.0) {
+            self.post_message(
+                WM_GPUI_CURSOR_STYLE_CHANGED,
+                WPARAM(0),
+                LPARAM(hcursor.map_or(0, |c| c.0 as isize)),
+            );
             lock.current_cursor = hcursor;
         }
     }
@@ -447,15 +581,11 @@ impl Platform for WindowsPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        write_to_clipboard(
-            item,
-            self.clipboard_hash_format,
-            self.clipboard_metadata_format,
-        );
+        write_to_clipboard(item);
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        read_from_clipboard(self.clipboard_hash_format, self.clipboard_metadata_format)
+        read_from_clipboard()
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {
@@ -493,7 +623,7 @@ impl Platform for WindowsPlatform {
                 CredReadW(
                     PCWSTR::from_raw(target_name.as_ptr()),
                     CRED_TYPE_GENERIC,
-                    0,
+                    None,
                     &mut credentials,
                 )?
             };
@@ -521,13 +651,39 @@ impl Platform for WindowsPlatform {
             .chain(Some(0))
             .collect_vec();
         self.foreground_executor().spawn(async move {
-            unsafe { CredDeleteW(PCWSTR::from_raw(target_name.as_ptr()), CRED_TYPE_GENERIC, 0)? };
+            unsafe {
+                CredDeleteW(
+                    PCWSTR::from_raw(target_name.as_ptr()),
+                    CRED_TYPE_GENERIC,
+                    None,
+                )?
+            };
             Ok(())
         })
     }
 
     fn register_url_scheme(&self, _: &str) -> Task<anyhow::Result<()>> {
         Task::ready(Err(anyhow!("register_url_scheme unimplemented")))
+    }
+
+    fn perform_dock_menu_action(&self, action: usize) {
+        unsafe {
+            PostThreadMessageW(
+                self.main_thread_id_win32,
+                WM_GPUI_DOCK_MENU_ACTION,
+                WPARAM(self.validation_number),
+                LPARAM(action as isize),
+            )
+            .log_err();
+        }
+    }
+
+    fn update_jump_list(
+        &self,
+        menus: Vec<MenuItem>,
+        entries: Vec<SmallVec<[PathBuf; 2]>>,
+    ) -> Vec<SmallVec<[PathBuf; 2]>> {
+        self.update_jump_list(menus, entries)
     }
 }
 
@@ -538,6 +694,16 @@ impl Drop for WindowsPlatform {
             OleUninitialize();
         }
     }
+}
+
+pub(crate) struct WindowCreationInfo {
+    pub(crate) icon: HICON,
+    pub(crate) executor: ForegroundExecutor,
+    pub(crate) current_cursor: Option<HCURSOR>,
+    pub(crate) windows_version: WindowsVersion,
+    pub(crate) validation_number: usize,
+    pub(crate) main_receiver: flume::Receiver<Runnable>,
+    pub(crate) main_thread_id_win32: u32,
 }
 
 fn open_target(target: &str) {
@@ -613,22 +779,32 @@ fn file_open_dialog(options: PathPromptOptions) -> Result<Option<Vec<PathBuf>>> 
 
 fn file_save_dialog(directory: PathBuf) -> Result<Option<PathBuf>> {
     let dialog: IFileSaveDialog = unsafe { CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)? };
-    if let Some(full_path) = directory.canonicalize().log_err() {
-        let full_path = full_path.to_string_lossy().to_string();
-        if !full_path.is_empty() {
+    if !directory.to_string_lossy().is_empty() {
+        if let Some(full_path) = directory.canonicalize().log_err() {
+            let full_path = SanitizedPath::from(full_path);
+            let full_path_string = full_path.to_string();
             let path_item: IShellItem =
-                unsafe { SHCreateItemFromParsingName(&HSTRING::from(&full_path), None)? };
+                unsafe { SHCreateItemFromParsingName(&HSTRING::from(full_path_string), None)? };
             unsafe { dialog.SetFolder(&path_item).log_err() };
         }
     }
     unsafe {
+        dialog.SetFileTypes(&[Common::COMDLG_FILTERSPEC {
+            pszName: windows::core::w!("All files"),
+            pszSpec: windows::core::w!("*.*"),
+        }])?;
         if dialog.Show(None).is_err() {
             // User cancelled
             return Ok(None);
         }
     }
     let shell_item = unsafe { dialog.GetResult()? };
-    let file_path_string = unsafe { shell_item.GetDisplayName(SIGDN_FILESYSPATH)?.to_string()? };
+    let file_path_string = unsafe {
+        let pwstr = shell_item.GetDisplayName(SIGDN_FILESYSPATH)?;
+        let string = pwstr.to_string()?;
+        CoTaskMemFree(Some(pwstr.0 as _));
+        string
+    };
     Ok(Some(PathBuf::from(file_path_string)))
 }
 
@@ -646,8 +822,8 @@ fn load_icon() -> Result<HICON> {
     let module = unsafe { GetModuleHandleW(None).context("unable to get module handle")? };
     let handle = unsafe {
         LoadImageW(
-            module,
-            IDI_APPLICATION,
+            Some(module.into()),
+            windows::core::PCWSTR(1 as _),
             IMAGE_ICON,
             0,
             0,
@@ -664,134 +840,58 @@ fn should_auto_hide_scrollbars() -> Result<bool> {
     Ok(ui_settings.AutoHideScrollBars()?)
 }
 
-fn register_clipboard_format(format: PCWSTR) -> Result<u32> {
-    let ret = unsafe { RegisterClipboardFormatW(format) };
-    if ret == 0 {
-        Err(anyhow::anyhow!(
-            "Error when registering clipboard format: {}",
-            std::io::Error::last_os_error()
-        ))
-    } else {
-        Ok(ret)
+struct KeyboardLayout {
+    id: String,
+    name: String,
+}
+
+impl PlatformKeyboardLayout for KeyboardLayout {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
     }
 }
 
-fn write_to_clipboard(item: ClipboardItem, hash_format: u32, metadata_format: u32) {
-    write_to_clipboard_inner(item, hash_format, metadata_format).log_err();
-    unsafe { CloseClipboard().log_err() };
-}
-
-fn write_to_clipboard_inner(
-    item: ClipboardItem,
-    hash_format: u32,
-    metadata_format: u32,
-) -> Result<()> {
-    unsafe {
-        OpenClipboard(None)?;
-        EmptyClipboard()?;
-        let encode_wide = item
-            .text()
-            .unwrap_or_default()
-            .encode_utf16()
-            .chain(Some(0))
-            .collect_vec();
-        set_data_to_clipboard(&encode_wide, CF_UNICODETEXT.0 as u32)?;
-
-        if let Some((metadata, text)) = item.metadata().zip(item.text()) {
-            let hash_result = {
-                let hash = ClipboardString::text_hash(&text);
-                hash.to_ne_bytes()
-            };
-            let encode_wide = std::slice::from_raw_parts(hash_result.as_ptr().cast::<u16>(), 4);
-            set_data_to_clipboard(encode_wide, hash_format)?;
-
-            let metadata_wide = metadata.encode_utf16().chain(Some(0)).collect_vec();
-            set_data_to_clipboard(&metadata_wide, metadata_format)?;
-        }
+impl KeyboardLayout {
+    fn new() -> Result<Self> {
+        let mut buffer = [0u16; KL_NAMELENGTH as usize];
+        unsafe { GetKeyboardLayoutNameW(&mut buffer)? };
+        let id = HSTRING::from_wide(&buffer).to_string();
+        let entry = windows_registry::LOCAL_MACHINE.open(format!(
+            "System\\CurrentControlSet\\Control\\Keyboard Layouts\\{}",
+            id
+        ))?;
+        let name = entry.get_hstring("Layout Text")?.to_string();
+        Ok(Self { id, name })
     }
-    Ok(())
-}
 
-fn set_data_to_clipboard(data: &[u16], format: u32) -> Result<()> {
-    unsafe {
-        let global = GlobalAlloc(GMEM_MOVEABLE, data.len() * 2)?;
-        let handle = GlobalLock(global);
-        u_memcpy(handle as _, data.as_ptr(), data.len() as _);
-        let _ = GlobalUnlock(global);
-        SetClipboardData(format, HANDLE(global.0))?;
-    }
-    Ok(())
-}
-
-fn read_from_clipboard(hash_format: u32, metadata_format: u32) -> Option<ClipboardItem> {
-    let result = read_from_clipboard_inner(hash_format, metadata_format).log_err();
-    unsafe { CloseClipboard().log_err() };
-    result
-}
-
-fn read_from_clipboard_inner(hash_format: u32, metadata_format: u32) -> Result<ClipboardItem> {
-    unsafe {
-        OpenClipboard(None)?;
-        let text = {
-            let handle = GetClipboardData(CF_UNICODETEXT.0 as u32)?;
-            let text = PCWSTR(handle.0 as *const u16);
-            String::from_utf16_lossy(text.as_wide())
-        };
-        let Some(hash) = read_hash_from_clipboard(hash_format) else {
-            return Ok(ClipboardItem::new_string(text));
-        };
-        let Some(metadata) = read_metadata_from_clipboard(metadata_format) else {
-            return Ok(ClipboardItem::new_string(text));
-        };
-        if hash == ClipboardString::text_hash(&text) {
-            Ok(ClipboardItem::new_string_with_metadata(text, metadata))
-        } else {
-            Ok(ClipboardItem::new_string(text))
+    fn unknown() -> Self {
+        Self {
+            id: "unknown".to_string(),
+            name: "unknown".to_string(),
         }
     }
 }
-
-fn read_hash_from_clipboard(hash_format: u32) -> Option<u64> {
-    unsafe {
-        let handle = GetClipboardData(hash_format).log_err()?;
-        let raw_ptr = handle.0 as *const u16;
-        let hash_bytes: [u8; 8] = std::slice::from_raw_parts(raw_ptr.cast::<u8>(), 8)
-            .to_vec()
-            .try_into()
-            .log_err()?;
-        Some(u64::from_ne_bytes(hash_bytes))
-    }
-}
-
-fn read_metadata_from_clipboard(metadata_format: u32) -> Option<String> {
-    unsafe {
-        let handle = GetClipboardData(metadata_format).log_err()?;
-        let text = PCWSTR(handle.0 as *const u16);
-        Some(String::from_utf16_lossy(text.as_wide()))
-    }
-}
-
-// clipboard
-pub const CLIPBOARD_HASH_FORMAT: PCWSTR = windows::core::w!("zed-text-hash");
-pub const CLIPBOARD_METADATA_FORMAT: PCWSTR = windows::core::w!("zed-metadata");
 
 #[cfg(test)]
 mod tests {
-    use crate::{ClipboardItem, Platform, WindowsPlatform};
+    use crate::{ClipboardItem, read_from_clipboard, write_to_clipboard};
 
     #[test]
     fn test_clipboard() {
-        let platform = WindowsPlatform::new();
-        let item = ClipboardItem::new_string("你好".to_string());
-        platform.write_to_clipboard(item.clone());
-        assert_eq!(platform.read_from_clipboard(), Some(item));
+        let item = ClipboardItem::new_string("你好，我是张小白".to_string());
+        write_to_clipboard(item.clone());
+        assert_eq!(read_from_clipboard(), Some(item));
 
         let item = ClipboardItem::new_string("12345".to_string());
-        platform.write_to_clipboard(item.clone());
-        assert_eq!(platform.read_from_clipboard(), Some(item));
+        write_to_clipboard(item.clone());
+        assert_eq!(read_from_clipboard(), Some(item));
 
         let item = ClipboardItem::new_string_with_json_metadata("abcdef".to_string(), vec![3, 4]);
-        platform.write_to_clipboard(item.clone());
-        assert_eq!(platform.read_from_clipboard(), Some(item));
+        write_to_clipboard(item.clone());
+        assert_eq!(read_from_clipboard(), Some(item));
     }
 }

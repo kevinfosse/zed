@@ -4,9 +4,11 @@
 
 - [Getting Started](./getting-started.md)
 - [System Requirements](./system-requirements.md)
+- [Accounts](./accounts.md)
 - [Linux](./linux.md)
 - [Windows](./windows.md)
 - [Telemetry](./telemetry.md)
+- [Workspace Persistence](./workspace-persistence.md)
 - [Additional Learning Materials](./additional-learning-materials.md)
 
 # Configuration
@@ -16,18 +18,23 @@
 - [Key bindings](./key-bindings.md)
 - [Snippets](./snippets.md)
 - [Themes](./themes.md)
+- [Icon Themes](./icon-themes.md)
+- [Vim Mode](./vim.md)
+
+<!-- - [Globs](./globs.md) -->
 <!-- - [Fonts](./fonts.md) -->
-- [Vim](./vim.md)
 
 # Using Zed
 
 - [Multibuffers](./multibuffers.md)
+- [Outline Panel](./outline-panel.md)
 - [Code Completions](./completions.md)
 - [Channels](./channels.md)
 - [Collaboration](./collaboration.md)
 - [Git](./git.md)
 - [Tasks](./tasks.md)
 - [Remote Development](./remote-development.md)
+- [Environment Variables](./environment.md)
 - [REPL](./repl.md)
 
 # Assistant
@@ -39,6 +46,9 @@
 - [Inline Assistant](./assistant/inline-assistant.md)
 - [Commands](./assistant/commands.md)
 - [Prompts](./assistant/prompting.md)
+- [Context Servers](./assistant/context-servers.md)
+  - [Model Context Protocol](./assistant/model-context-protocol.md)
+- [Model Improvement](./model-improvement.md)
 
 # Extensions
 
@@ -47,11 +57,14 @@
 - [Developing Extensions](./extensions/developing-extensions.md)
 - [Language Extensions](./extensions/languages.md)
 - [Theme Extensions](./extensions/themes.md)
-- [Slash Commands](./extensions/slash-commands.md)
+- [Icon Theme Extensions](./extensions/icon-themes.md)
+- [Slash Command Extensions](./extensions/slash-commands.md)
+- [Context Server Extensions](./extensions/context-servers.md)
 
 # Language Support
 
 - [All Languages](./languages.md)
+- [Ansible](./languages/ansible.md)
 - [AsciiDoc](./languages/asciidoc.md)
 - [Astro](./languages/astro.md)
 - [Bash](./languages/bash.md)
@@ -63,6 +76,7 @@
 - [CSS](./languages/css.md)
 - [Dart](./languages/dart.md)
 - [Deno](./languages/deno.md)
+- [Diff](./languages/diff.md)
 - [Docker](./languages/docker.md)
 - [Elixir](./languages/elixir.md)
 - [Elm](./languages/elm.md)
@@ -75,11 +89,13 @@
 - [Go](./languages/go.md)
 - [Groovy](./languages/groovy.md)
 - [Haskell](./languages/haskell.md)
+- [Helm](./languages/helm.md)
 - [HTML](./languages/html.md)
 - [Java](./languages/java.md)
 - [JavaScript](./languages/javascript.md)
 - [Julia](./languages/julia.md)
 - [JSON](./languages/json.md)
+- [Jsonnet](./languages/jsonnet.md)
 - [Kotlin](./languages/kotlin.md)
 - [Lua](./languages/lua.md)
 - [Luau](./languages/luau.md)
@@ -93,6 +109,7 @@
 - [PureScript](./languages/purescript.md)
 - [Python](./languages/python.md)
 - [R](./languages/r.md)
+- [Rego](./languages/rego.md)
 - [ReStructuredText](./languages/rst.md)
 - [Racket](./languages/racket.md)
 - [Roc](./languages/roc.md)
@@ -100,6 +117,7 @@
 - [Rust](./languages/rust.md)
 - [Scala](./languages/scala.md)
 - [Scheme](./languages/scheme.md)
+- [Shell Script](./languages/sh.md)
 - [Svelte](./languages/svelte.md)
 - [Swift](./languages/swift.md)
 - [Tailwind CSS](./languages/tailwindcss.md)
@@ -108,7 +126,9 @@
 - [TypeScript](./languages/typescript.md)
 - [Uiua](./languages/uiua.md)
 - [Vue](./languages/vue.md)
+- [XML](./languages/xml.md)
 - [YAML](./languages/yaml.md)
+- [Yara](./languages/yara.md)
 - [Yarn](./languages/yarn.md)
 - [Zig](./languages/zig.md)
 
@@ -119,12 +139,6 @@
   - [Linux](./development/linux.md)
   - [Windows](./development/windows.md)
   - [Local Collaboration](./development/local-collaboration.md)
+  - [Using Debuggers](./development/debuggers.md)
 - [Release Process](./development/releases.md)
 - [Debugging Crashes](./development/debugging-crashes.md)
-
-# Community
-
-- [Code of Conduct](./code-of-conduct.md)
-- [Contributing to Zed](./contribute-to-zed.md)
-- [Conversations](./conversations.md)
-- [Feedback and Support](./feedback-and-support.md)

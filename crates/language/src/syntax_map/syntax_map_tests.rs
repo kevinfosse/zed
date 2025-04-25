@@ -1,9 +1,9 @@
 use super::*;
 use crate::{
-    buffer_tests::{markdown_inline_lang, markdown_lang},
     LanguageConfig, LanguageMatcher,
+    buffer_tests::{markdown_inline_lang, markdown_lang},
 };
-use gpui::AppContext;
+use gpui::App;
 use rand::rngs::StdRng;
 use std::{env, ops::Range, sync::Arc};
 use text::{Buffer, BufferId};
@@ -83,7 +83,7 @@ fn test_splice_included_ranges() {
 }
 
 #[gpui::test]
-fn test_syntax_map_layers_for_range(cx: &mut AppContext) {
+fn test_syntax_map_layers_for_range(cx: &mut App) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
     let language = Arc::new(rust_lang());
     registry.add(language.clone());
@@ -103,7 +103,7 @@ fn test_syntax_map_layers_for_range(cx: &mut AppContext) {
         .unindent(),
     );
 
-    let mut syntax_map = SyntaxMap::new();
+    let mut syntax_map = SyntaxMap::new(&buffer);
     syntax_map.set_language_registry(registry.clone());
     syntax_map.reparse(language.clone(), &buffer);
 
@@ -153,14 +153,14 @@ fn test_syntax_map_layers_for_range(cx: &mut AppContext) {
     syntax_map.reparse(language.clone(), &buffer);
 
     assert_layers_for_range(
-            &syntax_map,
-            &buffer,
-            Point::new(2, 14)..Point::new(2, 16),
-            &[
-                "...(function_item ...",
-                "...(tuple_expression (call_expression ... arguments: (arguments (reference_expression value: (array_expression...",
-            ],
-        );
+        &syntax_map,
+        &buffer,
+        Point::new(2, 14)..Point::new(2, 16),
+        &[
+            "...(function_item ...",
+            "...(tuple_expression (call_expression ... arguments: (arguments (reference_expression value: (array_expression...",
+        ],
+    );
 
     // Put the vec! macro back, adding back the syntactic layer.
     buffer.undo();
@@ -180,7 +180,7 @@ fn test_syntax_map_layers_for_range(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_dynamic_language_injection(cx: &mut AppContext) {
+fn test_dynamic_language_injection(cx: &mut App) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
     let markdown = Arc::new(markdown_lang());
     let markdown_inline = Arc::new(markdown_inline_lang());
@@ -202,20 +202,20 @@ fn test_dynamic_language_injection(cx: &mut AppContext) {
         .unindent(),
     );
 
-    let mut syntax_map = SyntaxMap::new();
+    let mut syntax_map = SyntaxMap::new(&buffer);
     syntax_map.set_language_registry(registry.clone());
     syntax_map.reparse(markdown.clone(), &buffer);
     syntax_map.reparse(markdown_inline.clone(), &buffer);
     assert_layers_for_range(
-            &syntax_map,
-            &buffer,
-            Point::new(3, 0)..Point::new(3, 0),
-            &[
-                "(document (section (paragraph (inline)) (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
-                "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
-                "...(function_item name: (identifier) parameters: (parameters) body: (block)...",
-            ],
-        );
+        &syntax_map,
+        &buffer,
+        Point::new(3, 0)..Point::new(3, 0),
+        &[
+            "(document (section (paragraph (inline)) (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
+            "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
+            "...(function_item name: (identifier) parameters: (parameters) body: (block)...",
+        ],
+    );
 
     // Replace `rs` with a path to ending in `.rb` in code block.
     let macro_name_range = range_for_text(&buffer, "rs");
@@ -224,15 +224,15 @@ fn test_dynamic_language_injection(cx: &mut AppContext) {
     syntax_map.reparse(markdown.clone(), &buffer);
     syntax_map.reparse(markdown_inline.clone(), &buffer);
     assert_layers_for_range(
-            &syntax_map,
-            &buffer,
-            Point::new(3, 0)..Point::new(3, 0),
-            &[
-                "(document (section (paragraph (inline)) (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
-                "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
-                "...(call method: (identifier) arguments: (argument_list (call method: (identifier) arguments: (argument_list) block: (block)...",
-            ],
-        );
+        &syntax_map,
+        &buffer,
+        Point::new(3, 0)..Point::new(3, 0),
+        &[
+            "(document (section (paragraph (inline)) (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
+            "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
+            "...(call method: (identifier) arguments: (argument_list (call method: (identifier) arguments: (argument_list) block: (block)...",
+        ],
+    );
 
     // Replace Ruby with a language that hasn't been loaded yet.
     let macro_name_range = range_for_text(&buffer, "foo/bar/baz.rb");
@@ -241,34 +241,34 @@ fn test_dynamic_language_injection(cx: &mut AppContext) {
     syntax_map.reparse(markdown.clone(), &buffer);
     syntax_map.reparse(markdown_inline.clone(), &buffer);
     assert_layers_for_range(
-            &syntax_map,
-            &buffer,
-            Point::new(3, 0)..Point::new(3, 0),
-            &[
-                "(document (section (paragraph (inline)) (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
-                "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
-            ],
-        );
+        &syntax_map,
+        &buffer,
+        Point::new(3, 0)..Point::new(3, 0),
+        &[
+            "(document (section (paragraph (inline)) (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
+            "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
+        ],
+    );
     assert!(syntax_map.contains_unknown_injections());
 
     registry.add(Arc::new(html_lang()));
     syntax_map.reparse(markdown.clone(), &buffer);
     syntax_map.reparse(markdown_inline.clone(), &buffer);
     assert_layers_for_range(
-            &syntax_map,
-            &buffer,
-            Point::new(3, 0)..Point::new(3, 0),
-            &[
-                "(document (section (paragraph (inline)) (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
-                "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
-                "(document (text))",
-            ],
-        );
+        &syntax_map,
+        &buffer,
+        Point::new(3, 0)..Point::new(3, 0),
+        &[
+            "(document (section (paragraph (inline)) (fenced_code_block (fenced_code_block_delimiter) (info_string (language)) (block_continuation) (code_fence_content (block_continuation)) (fenced_code_block_delimiter))))",
+            "(inline (code_span (code_span_delimiter) (code_span_delimiter)))",
+            "(document (text))",
+        ],
+    );
     assert!(!syntax_map.contains_unknown_injections());
 }
 
 #[gpui::test]
-fn test_typing_multiple_new_injections(cx: &mut AppContext) {
+fn test_typing_multiple_new_injections(cx: &mut App) {
     let (buffer, syntax_map) = test_edit_sequence(
         "Rust",
         &[
@@ -298,7 +298,7 @@ fn test_typing_multiple_new_injections(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_pasting_new_injection_line_between_others(cx: &mut AppContext) {
+fn test_pasting_new_injection_line_between_others(cx: &mut App) {
     let (buffer, syntax_map) = test_edit_sequence(
         "Rust",
         &[
@@ -346,7 +346,7 @@ fn test_pasting_new_injection_line_between_others(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_joining_injections_with_child_injections(cx: &mut AppContext) {
+fn test_joining_injections_with_child_injections(cx: &mut App) {
     let (buffer, syntax_map) = test_edit_sequence(
         "Rust",
         &[
@@ -391,7 +391,7 @@ fn test_joining_injections_with_child_injections(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_editing_edges_of_injection(cx: &mut AppContext) {
+fn test_editing_edges_of_injection(cx: &mut App) {
     test_edit_sequence(
         "Rust",
         &[
@@ -421,7 +421,7 @@ fn test_editing_edges_of_injection(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_edits_preceding_and_intersecting_injection(cx: &mut AppContext) {
+fn test_edits_preceding_and_intersecting_injection(cx: &mut App) {
     test_edit_sequence(
         "Rust",
         &[
@@ -434,7 +434,7 @@ fn test_edits_preceding_and_intersecting_injection(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_non_local_changes_create_injections(cx: &mut AppContext) {
+fn test_non_local_changes_create_injections(cx: &mut App) {
     test_edit_sequence(
         "Rust",
         &[
@@ -454,7 +454,7 @@ fn test_non_local_changes_create_injections(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_creating_many_injections_in_one_edit(cx: &mut AppContext) {
+fn test_creating_many_injections_in_one_edit(cx: &mut App) {
     test_edit_sequence(
         "Rust",
         &[
@@ -485,7 +485,7 @@ fn test_creating_many_injections_in_one_edit(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_editing_across_injection_boundary(cx: &mut AppContext) {
+fn test_editing_across_injection_boundary(cx: &mut App) {
     test_edit_sequence(
         "Rust",
         &[
@@ -514,7 +514,7 @@ fn test_editing_across_injection_boundary(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_removing_injection_by_replacing_across_boundary(cx: &mut AppContext) {
+fn test_removing_injection_by_replacing_across_boundary(cx: &mut App) {
     test_edit_sequence(
         "Rust",
         &[
@@ -541,7 +541,7 @@ fn test_removing_injection_by_replacing_across_boundary(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_combined_injections_simple(cx: &mut AppContext) {
+fn test_combined_injections_simple(cx: &mut App) {
     let (buffer, syntax_map) = test_edit_sequence(
         "ERB",
         &[
@@ -589,7 +589,7 @@ fn test_combined_injections_simple(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_combined_injections_empty_ranges(cx: &mut AppContext) {
+fn test_combined_injections_empty_ranges(cx: &mut App) {
     test_edit_sequence(
         "ERB",
         &[
@@ -608,7 +608,7 @@ fn test_combined_injections_empty_ranges(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_combined_injections_edit_edges_of_ranges(cx: &mut AppContext) {
+fn test_combined_injections_edit_edges_of_ranges(cx: &mut App) {
     let (buffer, syntax_map) = test_edit_sequence(
         "ERB",
         &[
@@ -640,7 +640,7 @@ fn test_combined_injections_edit_edges_of_ranges(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_combined_injections_splitting_some_injections(cx: &mut AppContext) {
+fn test_combined_injections_splitting_some_injections(cx: &mut App) {
     let (_buffer, _syntax_map) = test_edit_sequence(
         "ERB",
         &[
@@ -666,7 +666,7 @@ fn test_combined_injections_splitting_some_injections(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_combined_injections_editing_after_last_injection(cx: &mut AppContext) {
+fn test_combined_injections_editing_after_last_injection(cx: &mut App) {
     test_edit_sequence(
         "ERB",
         &[
@@ -687,7 +687,7 @@ fn test_combined_injections_editing_after_last_injection(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_combined_injections_inside_injections(cx: &mut AppContext) {
+fn test_combined_injections_inside_injections(cx: &mut App) {
     let (buffer, syntax_map) = test_edit_sequence(
         "Markdown",
         &[
@@ -764,7 +764,7 @@ fn test_combined_injections_inside_injections(cx: &mut AppContext) {
 }
 
 #[gpui::test]
-fn test_empty_combined_injections_inside_injections(cx: &mut AppContext) {
+fn test_empty_combined_injections_inside_injections(cx: &mut App) {
     let (buffer, syntax_map) = test_edit_sequence(
         "Markdown",
         &[r#"
@@ -798,7 +798,7 @@ fn test_empty_combined_injections_inside_injections(cx: &mut AppContext) {
 }
 
 #[gpui::test(iterations = 50)]
-fn test_random_syntax_map_edits_rust_macros(rng: StdRng, cx: &mut AppContext) {
+fn test_random_syntax_map_edits_rust_macros(rng: StdRng, cx: &mut App) {
     let text = r#"
         fn test_something() {
             let vec = vec![5, 1, 3, 8];
@@ -824,7 +824,7 @@ fn test_random_syntax_map_edits_rust_macros(rng: StdRng, cx: &mut AppContext) {
 }
 
 #[gpui::test(iterations = 50)]
-fn test_random_syntax_map_edits_with_erb(rng: StdRng, cx: &mut AppContext) {
+fn test_random_syntax_map_edits_with_erb(rng: StdRng, cx: &mut App) {
     let text = r#"
         <div id="main">
         <% if one?(:two) %>
@@ -853,7 +853,7 @@ fn test_random_syntax_map_edits_with_erb(rng: StdRng, cx: &mut AppContext) {
 }
 
 #[gpui::test(iterations = 50)]
-fn test_random_syntax_map_edits_with_heex(rng: StdRng, cx: &mut AppContext) {
+fn test_random_syntax_map_edits_with_heex(rng: StdRng, cx: &mut App) {
     let text = r#"
         defmodule TheModule do
             def the_method(assigns) do
@@ -897,11 +897,11 @@ fn test_random_edits(
 
     let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), text);
 
-    let mut syntax_map = SyntaxMap::new();
+    let mut syntax_map = SyntaxMap::new(&buffer);
     syntax_map.set_language_registry(registry.clone());
     syntax_map.reparse(language.clone(), &buffer);
 
-    let mut reference_syntax_map = SyntaxMap::new();
+    let mut reference_syntax_map = SyntaxMap::new(&buffer);
     reference_syntax_map.set_language_registry(registry.clone());
 
     log::info!("initial text:\n{}", buffer.text());
@@ -918,7 +918,7 @@ fn test_random_edits(
 
         syntax_map.reparse(language.clone(), &buffer);
 
-        reference_syntax_map.clear();
+        reference_syntax_map.clear(&buffer);
         reference_syntax_map.reparse(language.clone(), &buffer);
     }
 
@@ -931,7 +931,7 @@ fn test_random_edits(
         syntax_map.interpolate(&buffer);
         syntax_map.reparse(language.clone(), &buffer);
 
-        reference_syntax_map.clear();
+        reference_syntax_map.clear(&buffer);
         reference_syntax_map.reparse(language.clone(), &buffer);
         assert_eq!(
             syntax_map.layers(&buffer).len(),
@@ -1060,11 +1060,7 @@ fn check_interpolation(
     }
 }
 
-fn test_edit_sequence(
-    language_name: &str,
-    steps: &[&str],
-    cx: &mut AppContext,
-) -> (Buffer, SyntaxMap) {
+fn test_edit_sequence(language_name: &str, steps: &[&str], cx: &mut App) -> (Buffer, SyntaxMap) {
     let registry = Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
     registry.add(Arc::new(elixir_lang()));
     registry.add(Arc::new(heex_lang()));
@@ -1082,7 +1078,7 @@ fn test_edit_sequence(
         .unwrap();
     let mut buffer = Buffer::new(0, BufferId::new(1).unwrap(), Default::default());
 
-    let mut mutated_syntax_map = SyntaxMap::new();
+    let mut mutated_syntax_map = SyntaxMap::new(&buffer);
     mutated_syntax_map.set_language_registry(registry.clone());
     mutated_syntax_map.reparse(language.clone(), &buffer);
 
@@ -1097,7 +1093,7 @@ fn test_edit_sequence(
 
         // Create a second syntax map from scratch
         log::info!("fresh parse {i}: {marked_string:?}");
-        let mut reference_syntax_map = SyntaxMap::new();
+        let mut reference_syntax_map = SyntaxMap::new(&buffer);
         reference_syntax_map.set_language_registry(registry.clone());
         reference_syntax_map.reparse(language.clone(), &buffer);
 
@@ -1138,7 +1134,7 @@ fn html_lang() -> Language {
             },
             ..Default::default()
         },
-        Some(tree_sitter_html::language()),
+        Some(tree_sitter_html::LANGUAGE.into()),
     )
     .with_highlights_query(
         r#"
@@ -1160,7 +1156,7 @@ fn ruby_lang() -> Language {
             },
             ..Default::default()
         },
-        Some(tree_sitter_ruby::language()),
+        Some(tree_sitter_ruby::LANGUAGE.into()),
     )
     .with_highlights_query(
         r#"
@@ -1182,7 +1178,7 @@ fn erb_lang() -> Language {
             },
             ..Default::default()
         },
-        Some(tree_sitter_embedded_template::language()),
+        Some(tree_sitter_embedded_template::LANGUAGE.into()),
     )
     .with_highlights_query(
         r#"
@@ -1193,15 +1189,15 @@ fn erb_lang() -> Language {
     .with_injection_query(
         r#"
             (
-                (code) @content
-                (#set! "language" "ruby")
-                (#set! "combined")
+                (code) @injection.content
+                (#set! injection.language "ruby")
+                (#set! injection.combined)
             )
 
             (
-                (content) @content
-                (#set! "language" "html")
-                (#set! "combined")
+                (content) @injection.content
+                (#set! injection.language "html")
+                (#set! injection.combined)
             )
         "#,
     )
@@ -1218,7 +1214,7 @@ fn rust_lang() -> Language {
             },
             ..Default::default()
         },
-        Some(tree_sitter_rust::language()),
+        Some(tree_sitter_rust::LANGUAGE.into()),
     )
     .with_highlights_query(
         r#"
@@ -1230,8 +1226,8 @@ fn rust_lang() -> Language {
     .with_injection_query(
         r#"
             (macro_invocation
-                (token_tree) @content
-                (#set! "language" "rust"))
+                (token_tree) @injection.content
+                (#set! injection.language "rust"))
         "#,
     )
     .unwrap()
@@ -1247,7 +1243,7 @@ fn elixir_lang() -> Language {
             },
             ..Default::default()
         },
-        Some(tree_sitter_elixir::language()),
+        Some(tree_sitter_elixir::LANGUAGE.into()),
     )
     .with_highlights_query(
         r#"
@@ -1267,7 +1263,7 @@ fn heex_lang() -> Language {
             },
             ..Default::default()
         },
-        Some(tree_sitter_heex::language()),
+        Some(tree_sitter_heex::LANGUAGE.into()),
     )
     .with_injection_query(
         r#"
@@ -1277,13 +1273,13 @@ fn heex_lang() -> Language {
               (partial_expression_value)
               (expression_value)
               (ending_expression_value)
-            ] @content)
-          (#set! language "elixir")
-          (#set! combined)
+            ] @injection.content)
+          (#set! injection.language "elixir")
+          (#set! injection.combined)
         )
 
-        ((expression (expression_value) @content)
-         (#set! language "elixir"))
+        ((expression (expression_value) @injection.content)
+         (#set! injection.language "elixir"))
         "#,
     )
     .unwrap()

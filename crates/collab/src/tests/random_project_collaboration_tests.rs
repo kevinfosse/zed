@@ -1,21 +1,20 @@
 use super::{RandomizedTest, TestClient, TestError, TestServer, UserTestPlan};
 use crate::{db::UserId, tests::run_randomized_test};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use call::ActiveCall;
 use collections::{BTreeMap, HashMap};
 use editor::Bias;
 use fs::{FakeFs, Fs as _};
-use futures::StreamExt;
-use git::repository::GitFileStatus;
-use gpui::{BackgroundExecutor, Model, TestAppContext};
+use git::status::{FileStatus, StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
+use gpui::{BackgroundExecutor, Entity, TestAppContext};
 use language::{
-    range_to_lsp, FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, PointUtf16,
+    FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, PointUtf16, range_to_lsp,
 };
 use lsp::FakeLanguageServer;
 use pretty_assertions::assert_eq;
 use project::{
-    search::SearchQuery, search::SearchResult, Project, ProjectPath, DEFAULT_COMPLETION_CONTEXT,
+    DEFAULT_COMPLETION_CONTEXT, Project, ProjectPath, search::SearchQuery, search::SearchResult,
 };
 use rand::{
     distributions::{Alphanumeric, DistString},
@@ -28,7 +27,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
-use util::ResultExt;
+use util::{ResultExt, path};
 
 #[gpui::test(
     iterations = 100,
@@ -128,8 +127,7 @@ enum GitOperation {
     },
     WriteGitStatuses {
         repo_path: PathBuf,
-        statuses: Vec<(PathBuf, GitFileStatus)>,
-        git_operation: bool,
+        statuses: Vec<(PathBuf, FileStatus)>,
     },
 }
 
@@ -281,8 +279,8 @@ impl RandomizedTest for ProjectCollaborationTest {
                             let project_root_name = root_name_for_project(&project, cx);
                             let mut paths = client.fs().paths(false);
                             paths.remove(0);
-                            let new_root_path = if paths.is_empty() || rng.gen() {
-                                Path::new("/").join(plan.next_root_dir_name())
+                            let new_root_path = if paths.is_empty() || rng.r#gen() {
+                                Path::new(path!("/")).join(plan.next_root_dir_name())
                             } else {
                                 paths.choose(rng).unwrap().clone()
                             };
@@ -298,8 +296,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                                 continue;
                             };
                             let project_root_name = root_name_for_project(&project, cx);
-                            let is_local =
-                                project.read_with(cx, |project, _| project.is_local_or_ssh());
+                            let is_local = project.read_with(cx, |project, _| project.is_local());
                             let worktree = project.read_with(cx, |project, cx| {
                                 project
                                     .worktrees(cx)
@@ -312,7 +309,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                                     .choose(rng)
                             });
                             let Some(worktree) = worktree else { continue };
-                            let is_dir = rng.gen::<bool>();
+                            let is_dir = rng.r#gen::<bool>();
                             let mut full_path =
                                 worktree.read_with(cx, |w, _| PathBuf::from(w.root_name()));
                             full_path.push(gen_file_name(rng));
@@ -335,7 +332,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                         continue;
                     };
                     let project_root_name = root_name_for_project(&project, cx);
-                    let is_local = project.read_with(cx, |project, _| project.is_local_or_ssh());
+                    let is_local = project.read_with(cx, |project, _| project.is_local());
 
                     match rng.gen_range(0..100_u32) {
                         // Manipulate an existing buffer
@@ -390,7 +387,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                                             language::Bias::Left,
                                         )
                                     });
-                                    let detach = rng.gen();
+                                    let detach = rng.r#gen();
                                     break ClientOperation::RequestLspDataInBuffer {
                                         project_root_name,
                                         full_path,
@@ -463,7 +460,7 @@ impl RandomizedTest for ProjectCollaborationTest {
 
                 // Create or update a file or directory
                 96.. => {
-                    let is_dir = rng.gen::<bool>();
+                    let is_dir = rng.r#gen::<bool>();
                     let content;
                     let mut path;
                     let dir_paths = client.fs().directories(false);
@@ -550,7 +547,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                     first_root_name
                 );
 
-                let root_path = Path::new("/").join(&first_root_name);
+                let root_path = Path::new(path!("/")).join(&first_root_name);
                 client.fs().create_dir(&root_path).await.unwrap();
                 client
                     .fs()
@@ -787,10 +784,12 @@ impl RandomizedTest for ProjectCollaborationTest {
                 let save = cx.spawn(|cx| async move {
                     save.await
                         .map_err(|err| anyhow!("save request failed: {:?}", err))?;
-                    assert!(buffer
-                        .read_with(&cx, |buffer, _| { buffer.saved_version().to_owned() })
-                        .expect("App should not be dropped")
-                        .observed_all(&requested_version));
+                    assert!(
+                        buffer
+                            .read_with(&cx, |buffer, _| { buffer.saved_version().to_owned() })
+                            .expect("App should not be dropped")
+                            .observed_all(&requested_version)
+                    );
                     anyhow::Ok(())
                 });
                 if detach {
@@ -836,7 +835,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                         .map_ok(|_| ())
                         .boxed(),
                     LspRequestKind::CodeAction => project
-                        .code_actions(&buffer, offset..offset, cx)
+                        .code_actions(&buffer, offset..offset, None, cx)
                         .map(|_| Ok(()))
                         .boxed(),
                     LspRequestKind::Definition => project
@@ -874,7 +873,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                     if detach { "detaching" } else { "awaiting" }
                 );
 
-                let mut search = project.update(cx, |project, cx| {
+                let search = project.update(cx, |project, cx| {
                     project.search(
                         SearchQuery::text(
                             query,
@@ -883,6 +882,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                             false,
                             Default::default(),
                             Default::default(),
+                            false,
                             None,
                         )
                         .unwrap(),
@@ -892,7 +892,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                 drop(project);
                 let search = cx.executor().spawn(async move {
                     let mut results = HashMap::default();
-                    while let Some(result) = search.next().await {
+                    while let Ok(result) = search.recv().await {
                         if let SearchResult::Buffer { buffer, ranges } = result {
                             results.entry(buffer).or_insert(ranges);
                         }
@@ -955,8 +955,8 @@ impl RandomizedTest for ProjectCollaborationTest {
 
                     let dot_git_dir = repo_path.join(".git");
                     let contents = contents
-                        .iter()
-                        .map(|(path, contents)| (path.as_path(), contents.clone()))
+                        .into_iter()
+                        .map(|(path, contents)| (path.into(), contents))
                         .collect::<Vec<_>>();
                     if client.fs().metadata(&dot_git_dir).await?.is_none() {
                         client.fs().create_dir(&dot_git_dir).await?;
@@ -989,7 +989,6 @@ impl RandomizedTest for ProjectCollaborationTest {
                 GitOperation::WriteGitStatuses {
                     repo_path,
                     statuses,
-                    git_operation,
                 } => {
                     if !client.fs().directories(false).contains(&repo_path) {
                         return Err(TestError::Inapplicable);
@@ -1018,17 +1017,9 @@ impl RandomizedTest for ProjectCollaborationTest {
                         client.fs().create_dir(&dot_git_dir).await?;
                     }
 
-                    if git_operation {
-                        client.fs().set_status_for_repo_via_git_operation(
-                            &dot_git_dir,
-                            statuses.as_slice(),
-                        );
-                    } else {
-                        client.fs().set_status_for_repo_via_working_copy_change(
-                            &dot_git_dir,
-                            statuses.as_slice(),
-                        );
-                    }
+                    client
+                        .fs()
+                        .set_status_for_repo(&dot_git_dir, statuses.as_slice());
                 }
             },
         }
@@ -1047,7 +1038,7 @@ impl RandomizedTest for ProjectCollaborationTest {
             },
             None,
         )));
-        client.language_registry().register_fake_lsp_adapter(
+        client.language_registry().register_fake_lsp(
             "Rust",
             FakeLspAdapter {
                 name: "the-fake-language-server",
@@ -1055,7 +1046,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                 initializer: Some(Box::new({
                     let fs = client.app_state.fs.clone();
                     move |fake_server: &mut FakeLanguageServer| {
-                        fake_server.handle_request::<lsp::request::Completion, _, _>(
+                        fake_server.set_request_handler::<lsp::request::Completion, _, _>(
                             |_, _| async move {
                                 Ok(Some(lsp::CompletionResponse::Array(vec![
                                     lsp::CompletionItem {
@@ -1074,7 +1065,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                             },
                         );
 
-                        fake_server.handle_request::<lsp::request::CodeActionRequest, _, _>(
+                        fake_server.set_request_handler::<lsp::request::CodeActionRequest, _, _>(
                             |_, _| async move {
                                 Ok(Some(vec![lsp::CodeActionOrCommand::CodeAction(
                                     lsp::CodeAction {
@@ -1085,16 +1076,17 @@ impl RandomizedTest for ProjectCollaborationTest {
                             },
                         );
 
-                        fake_server.handle_request::<lsp::request::PrepareRenameRequest, _, _>(
-                            |params, _| async move {
-                                Ok(Some(lsp::PrepareRenameResponse::Range(lsp::Range::new(
-                                    params.position,
-                                    params.position,
-                                ))))
-                            },
-                        );
+                        fake_server
+                            .set_request_handler::<lsp::request::PrepareRenameRequest, _, _>(
+                                |params, _| async move {
+                                    Ok(Some(lsp::PrepareRenameResponse::Range(lsp::Range::new(
+                                        params.position,
+                                        params.position,
+                                    ))))
+                                },
+                            );
 
-                        fake_server.handle_request::<lsp::request::GotoDefinition, _, _>({
+                        fake_server.set_request_handler::<lsp::request::GotoDefinition, _, _>({
                             let fs = fs.clone();
                             move |_, cx| {
                                 let background = cx.background_executor();
@@ -1119,32 +1111,34 @@ impl RandomizedTest for ProjectCollaborationTest {
                             }
                         });
 
-                        fake_server.handle_request::<lsp::request::DocumentHighlightRequest, _, _>(
-                            move |_, cx| {
-                                let mut highlights = Vec::new();
-                                let background = cx.background_executor();
-                                let mut rng = background.rng();
+                        fake_server
+                            .set_request_handler::<lsp::request::DocumentHighlightRequest, _, _>(
+                                move |_, cx| {
+                                    let mut highlights = Vec::new();
+                                    let background = cx.background_executor();
+                                    let mut rng = background.rng();
 
-                                let highlight_count = rng.gen_range(1..=5);
-                                for _ in 0..highlight_count {
-                                    let start_row = rng.gen_range(0..100);
-                                    let start_column = rng.gen_range(0..100);
-                                    let end_row = rng.gen_range(0..100);
-                                    let end_column = rng.gen_range(0..100);
-                                    let start = PointUtf16::new(start_row, start_column);
-                                    let end = PointUtf16::new(end_row, end_column);
-                                    let range = if start > end { end..start } else { start..end };
-                                    highlights.push(lsp::DocumentHighlight {
-                                        range: range_to_lsp(range.clone()),
-                                        kind: Some(lsp::DocumentHighlightKind::READ),
+                                    let highlight_count = rng.gen_range(1..=5);
+                                    for _ in 0..highlight_count {
+                                        let start_row = rng.gen_range(0..100);
+                                        let start_column = rng.gen_range(0..100);
+                                        let end_row = rng.gen_range(0..100);
+                                        let end_column = rng.gen_range(0..100);
+                                        let start = PointUtf16::new(start_row, start_column);
+                                        let end = PointUtf16::new(end_row, end_column);
+                                        let range =
+                                            if start > end { end..start } else { start..end };
+                                        highlights.push(lsp::DocumentHighlight {
+                                            range: range_to_lsp(range.clone()).unwrap(),
+                                            kind: Some(lsp::DocumentHighlightKind::READ),
+                                        });
+                                    }
+                                    highlights.sort_unstable_by_key(|highlight| {
+                                        (highlight.range.start, highlight.range.end)
                                     });
-                                }
-                                highlights.sort_unstable_by_key(|highlight| {
-                                    (highlight.range.start, highlight.range.end)
-                                });
-                                async move { Ok(Some(highlights)) }
-                            },
-                        );
+                                    async move { Ok(Some(highlights)) }
+                                },
+                            );
                     }
                 })),
                 ..Default::default()
@@ -1169,7 +1163,7 @@ impl RandomizedTest for ProjectCollaborationTest {
                             Some((project, cx))
                         });
 
-                        if !guest_project.is_disconnected() {
+                        if !guest_project.is_disconnected(cx) {
                             if let Some((host_project, host_cx)) = host_project {
                                 let host_worktree_snapshots =
                                     host_project.read_with(host_cx, |host_project, cx| {
@@ -1188,11 +1182,22 @@ impl RandomizedTest for ProjectCollaborationTest {
                                         (worktree.id(), worktree.snapshot())
                                     })
                                     .collect::<BTreeMap<_, _>>();
+                                let host_repository_snapshots = host_project.read_with(host_cx, |host_project, cx| {
+                                    host_project.git_store().read(cx).repo_snapshots(cx)
+                                });
+                                let guest_repository_snapshots = guest_project.git_store().read(cx).repo_snapshots(cx);
 
                                 assert_eq!(
                                     guest_worktree_snapshots.values().map(|w| w.abs_path()).collect::<Vec<_>>(),
                                     host_worktree_snapshots.values().map(|w| w.abs_path()).collect::<Vec<_>>(),
                                     "{} has different worktrees than the host for project {:?}",
+                                    client.username, guest_project.remote_id(),
+                                );
+
+                                assert_eq!(
+                                    guest_repository_snapshots.values().collect::<Vec<_>>(),
+                                    host_repository_snapshots.values().collect::<Vec<_>>(),
+                                    "{} has different repositories than the host for project {:?}",
                                     client.username, guest_project.remote_id(),
                                 );
 
@@ -1223,12 +1228,6 @@ impl RandomizedTest for ProjectCollaborationTest {
                                         id,
                                         guest_project.remote_id(),
                                     );
-                                    assert_eq!(guest_snapshot.repositories().collect::<Vec<_>>(), host_snapshot.repositories().collect::<Vec<_>>(),
-                                        "{} has different repositories than the host for worktree {:?} and project {:?}",
-                                        client.username,
-                                        host_snapshot.abs_path(),
-                                        guest_project.remote_id(),
-                                    );
                                     assert_eq!(guest_snapshot.scan_id(), host_snapshot.scan_id(),
                                         "{} has different scan id than the host for worktree {:?} and project {:?}",
                                         client.username,
@@ -1255,8 +1254,8 @@ impl RandomizedTest for ProjectCollaborationTest {
 
             let buffers = client.buffers().clone();
             for (guest_project, guest_buffers) in &buffers {
-                let project_id = if guest_project.read_with(client_cx, |project, _| {
-                    project.is_local_or_ssh() || project.is_disconnected()
+                let project_id = if guest_project.read_with(client_cx, |project, cx| {
+                    project.is_local() || project.is_disconnected(cx)
                 }) {
                     continue;
                 } else {
@@ -1324,11 +1323,10 @@ impl RandomizedTest for ProjectCollaborationTest {
                     match (host_file, guest_file) {
                         (Some(host_file), Some(guest_file)) => {
                             assert_eq!(guest_file.path(), host_file.path());
-                            assert_eq!(guest_file.is_deleted(), host_file.is_deleted());
                             assert_eq!(
-                                guest_file.mtime(),
-                                host_file.mtime(),
-                                "guest {} mtime does not match host {} for path {:?} in project {}",
+                                guest_file.disk_state(),
+                                host_file.disk_state(),
+                                "guest {} disk_state does not match host {} for path {:?} in project {}",
                                 guest_user_id,
                                 host_user_id,
                                 guest_file.path(),
@@ -1340,57 +1338,73 @@ impl RandomizedTest for ProjectCollaborationTest {
                         (_, None) => panic!("guest's file is None, hosts's isn't"),
                     }
 
-                    let host_diff_base = host_buffer
-                        .read_with(host_cx, |b, _| b.diff_base().map(ToString::to_string));
-                    let guest_diff_base = guest_buffer
-                        .read_with(client_cx, |b, _| b.diff_base().map(ToString::to_string));
+                    let host_diff_base = host_project.read_with(host_cx, |project, cx| {
+                        project
+                            .git_store()
+                            .read(cx)
+                            .get_unstaged_diff(host_buffer.read(cx).remote_id(), cx)
+                            .unwrap()
+                            .read(cx)
+                            .base_text_string()
+                    });
+                    let guest_diff_base = guest_project.read_with(client_cx, |project, cx| {
+                        project
+                            .git_store()
+                            .read(cx)
+                            .get_unstaged_diff(guest_buffer.read(cx).remote_id(), cx)
+                            .unwrap()
+                            .read(cx)
+                            .base_text_string()
+                    });
                     assert_eq!(
-                            guest_diff_base, host_diff_base,
-                            "guest {} diff base does not match host's for path {path:?} in project {project_id}",
-                            client.username
-                        );
+                        guest_diff_base, host_diff_base,
+                        "guest {} diff base does not match host's for path {path:?} in project {project_id}",
+                        client.username
+                    );
 
                     let host_saved_version =
                         host_buffer.read_with(host_cx, |b, _| b.saved_version().clone());
                     let guest_saved_version =
                         guest_buffer.read_with(client_cx, |b, _| b.saved_version().clone());
                     assert_eq!(
-                            guest_saved_version, host_saved_version,
-                            "guest {} saved version does not match host's for path {path:?} in project {project_id}",
-                            client.username
-                        );
+                        guest_saved_version, host_saved_version,
+                        "guest {} saved version does not match host's for path {path:?} in project {project_id}",
+                        client.username
+                    );
 
                     let host_is_dirty = host_buffer.read_with(host_cx, |b, _| b.is_dirty());
                     let guest_is_dirty = guest_buffer.read_with(client_cx, |b, _| b.is_dirty());
                     assert_eq!(
-                            guest_is_dirty, host_is_dirty,
-                            "guest {} dirty state does not match host's for path {path:?} in project {project_id}",
-                            client.username
-                        );
+                        guest_is_dirty, host_is_dirty,
+                        "guest {} dirty state does not match host's for path {path:?} in project {project_id}",
+                        client.username
+                    );
 
                     let host_saved_mtime = host_buffer.read_with(host_cx, |b, _| b.saved_mtime());
                     let guest_saved_mtime =
                         guest_buffer.read_with(client_cx, |b, _| b.saved_mtime());
                     assert_eq!(
-                            guest_saved_mtime, host_saved_mtime,
-                            "guest {} saved mtime does not match host's for path {path:?} in project {project_id}",
-                            client.username
-                        );
+                        guest_saved_mtime, host_saved_mtime,
+                        "guest {} saved mtime does not match host's for path {path:?} in project {project_id}",
+                        client.username
+                    );
 
                     let host_is_dirty = host_buffer.read_with(host_cx, |b, _| b.is_dirty());
                     let guest_is_dirty = guest_buffer.read_with(client_cx, |b, _| b.is_dirty());
-                    assert_eq!(guest_is_dirty, host_is_dirty,
-                            "guest {} dirty status does not match host's for path {path:?} in project {project_id}",
-                            client.username
-                        );
+                    assert_eq!(
+                        guest_is_dirty, host_is_dirty,
+                        "guest {} dirty status does not match host's for path {path:?} in project {project_id}",
+                        client.username
+                    );
 
                     let host_has_conflict = host_buffer.read_with(host_cx, |b, _| b.has_conflict());
                     let guest_has_conflict =
                         guest_buffer.read_with(client_cx, |b, _| b.has_conflict());
-                    assert_eq!(guest_has_conflict, host_has_conflict,
-                            "guest {} conflict status does not match host's for path {path:?} in project {project_id}",
-                            client.username
-                        );
+                    assert_eq!(
+                        guest_has_conflict, host_has_conflict,
+                        "guest {} conflict status does not match host's for path {path:?} in project {project_id}",
+                        client.username
+                    );
                 }
             }
         }
@@ -1446,28 +1460,13 @@ fn generate_git_operation(rng: &mut StdRng, client: &TestClient) -> GitOperation
         }
         64..=100 => {
             let file_paths = generate_file_paths(&repo_path, rng, client);
-
             let statuses = file_paths
                 .into_iter()
-                .map(|paths| {
-                    (
-                        paths,
-                        match rng.gen_range(0..3_u32) {
-                            0 => GitFileStatus::Added,
-                            1 => GitFileStatus::Modified,
-                            2 => GitFileStatus::Conflict,
-                            _ => unreachable!(),
-                        },
-                    )
-                })
+                .map(|path| (path, gen_status(rng)))
                 .collect::<Vec<_>>();
-
-            let git_operation = rng.gen::<bool>();
-
             GitOperation::WriteGitStatuses {
                 repo_path,
                 statuses,
-                git_operation,
             }
         }
         _ => unreachable!(),
@@ -1476,10 +1475,10 @@ fn generate_git_operation(rng: &mut StdRng, client: &TestClient) -> GitOperation
 
 fn buffer_for_full_path(
     client: &TestClient,
-    project: &Model<Project>,
+    project: &Entity<Project>,
     full_path: &PathBuf,
     cx: &TestAppContext,
-) -> Option<Model<language::Buffer>> {
+) -> Option<Entity<language::Buffer>> {
     client
         .buffers_for_project(project)
         .iter()
@@ -1495,7 +1494,7 @@ fn project_for_root_name(
     client: &TestClient,
     root_name: &str,
     cx: &TestAppContext,
-) -> Option<Model<Project>> {
+) -> Option<Entity<Project>> {
     if let Some(ix) = project_ix_for_root_name(client.local_projects().deref(), root_name, cx) {
         return Some(client.local_projects()[ix].clone());
     }
@@ -1507,7 +1506,7 @@ fn project_for_root_name(
 }
 
 fn project_ix_for_root_name(
-    projects: &[Model<Project>],
+    projects: &[Entity<Project>],
     root_name: &str,
     cx: &TestAppContext,
 ) -> Option<usize> {
@@ -1519,7 +1518,7 @@ fn project_ix_for_root_name(
     })
 }
 
-fn root_name_for_project(project: &Model<Project>, cx: &TestAppContext) -> String {
+fn root_name_for_project(project: &Entity<Project>, cx: &TestAppContext) -> String {
     project.read_with(cx, |project, cx| {
         project
             .visible_worktrees(cx)
@@ -1532,7 +1531,7 @@ fn root_name_for_project(project: &Model<Project>, cx: &TestAppContext) -> Strin
 }
 
 fn project_path_for_full_path(
-    project: &Model<Project>,
+    project: &Entity<Project>,
     full_path: &Path,
     cx: &TestAppContext,
 ) -> Option<ProjectPath> {
@@ -1553,16 +1552,14 @@ fn project_path_for_full_path(
 }
 
 async fn ensure_project_shared(
-    project: &Model<Project>,
+    project: &Entity<Project>,
     client: &TestClient,
     cx: &mut TestAppContext,
 ) {
     let first_root_name = root_name_for_project(project, cx);
     let active_call = cx.read(ActiveCall::global);
     if active_call.read_with(cx, |call, _| call.room().is_some())
-        && project.read_with(cx, |project, _| {
-            project.is_local_or_ssh() && !project.is_shared()
-        })
+        && project.read_with(cx, |project, _| project.is_local() && !project.is_shared())
     {
         match active_call
             .update(cx, |call, cx| call.share_project(project.clone(), cx))
@@ -1588,7 +1585,7 @@ async fn ensure_project_shared(
     }
 }
 
-fn choose_random_project(client: &TestClient, rng: &mut StdRng) -> Option<Model<Project>> {
+fn choose_random_project(client: &TestClient, rng: &mut StdRng) -> Option<Entity<Project>> {
     client
         .local_projects()
         .deref()
@@ -1605,4 +1602,46 @@ fn gen_file_name(rng: &mut StdRng) -> String {
         name.push(letter);
     }
     name
+}
+
+fn gen_status(rng: &mut StdRng) -> FileStatus {
+    fn gen_tracked_status(rng: &mut StdRng) -> TrackedStatus {
+        match rng.gen_range(0..3) {
+            0 => TrackedStatus {
+                index_status: StatusCode::Unmodified,
+                worktree_status: StatusCode::Unmodified,
+            },
+            1 => TrackedStatus {
+                index_status: StatusCode::Modified,
+                worktree_status: StatusCode::Modified,
+            },
+            2 => TrackedStatus {
+                index_status: StatusCode::Added,
+                worktree_status: StatusCode::Modified,
+            },
+            3 => TrackedStatus {
+                index_status: StatusCode::Added,
+                worktree_status: StatusCode::Unmodified,
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn gen_unmerged_status_code(rng: &mut StdRng) -> UnmergedStatusCode {
+        match rng.gen_range(0..3) {
+            0 => UnmergedStatusCode::Updated,
+            1 => UnmergedStatusCode::Added,
+            2 => UnmergedStatusCode::Deleted,
+            _ => unreachable!(),
+        }
+    }
+
+    match rng.gen_range(0..2) {
+        0 => FileStatus::Unmerged(UnmergedStatus {
+            first_head: gen_unmerged_status_code(rng),
+            second_head: gen_unmerged_status_code(rng),
+        }),
+        1 => FileStatus::Tracked(gen_tracked_status(rng)),
+        _ => unreachable!(),
+    }
 }
