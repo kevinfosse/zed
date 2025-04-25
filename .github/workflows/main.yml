@@ -25,7 +25,7 @@ jobs:
       - name: Build Zed (Release)
         run: cargo build --release
       - name: Upload Zed binary as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: zed-binary
           path: target/release/zed.exe
@@ -43,7 +43,7 @@ jobs:
         run: |
           C:\msys64\usr\bin\bash -lc "pacman -S mingw-w64-ucrt-x86_64-zed --noconfirm"
       - name: Upload MSYS2 Zed binary as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: msys2-zed-binary
           path: C:/msys64/mingw64/bin/zed.exe
